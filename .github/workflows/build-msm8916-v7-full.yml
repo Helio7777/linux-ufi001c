@@ -89,15 +89,10 @@ jobs:
       - name: Checkout current repo
         uses: actions/checkout@v4
 
-      - name: Enable arm64 multiarch
-        run: |
-          set -euxo pipefail
-          sudo dpkg --add-architecture arm64
-          sudo apt-get update
-
       - name: Install dependencies
         run: |
           set -euxo pipefail
+          sudo apt-get update
           sudo apt-get install -y \
             git \
             curl \
@@ -111,11 +106,8 @@ jobs:
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
             libssl-dev \
-            libssl-dev:arm64 \
             libelf-dev \
-            libelf-dev:arm64 \
             libdw-dev \
-            libdw-dev:arm64 \
             libncurses-dev \
             pahole \
             cpio \

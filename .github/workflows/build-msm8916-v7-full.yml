@@ -398,31 +398,34 @@ jobs:
 
           cat build/arch/arm64/boot/Image.gz "build/${{ inputs.device_dtb }}" > artifacts/kernel/kernel-dtb
 
-
-      - name: Build Debian packages
+      - name: Check kernel-package availability
         run: |
           set -euxo pipefail
-          make -C linux \
-            O="$PWD/build" \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LOCALVERSION=-msm8916-ufi001c \
-            KBUILD_DEBARCH=arm64 \
-            KDEB_PKGVERSION=1.4 \
-            KDEB_SOURCENAME=linux-upstream-msm8916 \
-            DPKG_FLAGS=-d \
-            -j"$(nproc)" \
-            bindeb-pkg
-
-      - name: Collect Debian packages
+          apt-cache policy kernel-package
+      - name: Install kernel-package
         run: |
           set -euxo pipefail
-          find "$GITHUB_WORKSPACE" -maxdepth 1 -type f \
-            \( -name "*.deb" -o -name "*.changes" -o -name "*.buildinfo" \) \
-            -exec cp -t artifacts/deb {} +
+          sudo apt-get update
+          sudo apt-get install -y kernel-package
+      - name: Build Debian packages with make-kpkg
+        run: |
+          set -euxo pipefail
+          cd linux
+          fakeroot make-kpkg \
+            --initrd \
+            --cross-compile aarch64-linux-gnu- \
+            --arch arm64 \
+            --append-to-version -msm8916-ufi001c \
+            --revision 1.4 \
+            kernel_image kernel_headers
+      - name: Collect artifacts
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts
+          cp -v ./*.deb artifacts/ || true
+          cp -v linux/arch/arm64/boot/Image.gz artifacts/ || true
 
-          ls -lah artifacts/deb
-
+    
       - name: Download and extract debian.zip
         run: |
           set -euxo pipefail

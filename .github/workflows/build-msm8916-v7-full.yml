@@ -422,24 +422,25 @@ jobs:
       - name: Build Debian packages with bindeb-pkg
         run: |
           set -euxo pipefail
-          cd linux
-      
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-      
-          fakeroot make -j"$(nproc)" \
+          test -f build/.config
+          fakeroot make -C linux \
+            O="$PWD/build" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            KBUILD_DEBARCH="$KBUILD_DEBARCH" \
+            LOCALVERSION="$LOCALVERSION" \
+            -j"$(nproc)" \
             bindeb-pkg \
-            KDEB_PKGVERSION=1.4 \
-            LOCALVERSION=-msm8916-ufi001c
+            KDEB_PKGVERSION=1.4
       
-      - name: Collect artifacts
+      - name: Collect Debian package artifacts
         run: |
           set -euxo pipefail
-          mkdir -p artifacts
-          find linux/.. -maxdepth 1 -type f -name "*.deb" -exec cp -v {} artifacts/ \; || true
-          find linux/.. -maxdepth 1 -type f -name "*.changes" -exec cp -v {} artifacts/ \; || true
-          find linux/.. -maxdepth 1 -type f -name "*.buildinfo" -exec cp -v {} artifacts/ \; || true
-          cp -v linux/arch/arm64/boot/Image.gz artifacts/ || true
+          mkdir -p artifacts/deb
+          find . -maxdepth 1 -type f -name "*.deb" -exec cp -v {} artifacts/deb/ \;
+          find . -maxdepth 1 -type f -name "*.changes" -exec cp -v {} artifacts/deb/ \; || true
+          find . -maxdepth 1 -type f -name "*.buildinfo" -exec cp -v {} artifacts/deb/ \; || true
+          ls -lah artifacts/deb
 
     
       - name: Download and extract debian.zip

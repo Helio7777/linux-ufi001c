@@ -398,31 +398,47 @@ jobs:
 
           cat build/arch/arm64/boot/Image.gz "build/${{ inputs.device_dtb }}" > artifacts/kernel/kernel-dtb
 
-      - name: Check kernel-package availability
-        run: |
-          set -euxo pipefail
-          apt-cache policy kernel-package
-      - name: Install kernel-package
+      - name: Install build dependencies
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y kernel-package
-      - name: Build Debian packages with make-kpkg
+          sudo apt-get install -y \
+            build-essential \
+            bc \
+            bison \
+            flex \
+            fakeroot \
+            dpkg-dev \
+            debhelper \
+            rsync \
+            kmod \
+            cpio \
+            python3 \
+            libssl-dev \
+            libelf-dev \
+            dwarves \
+            crossbuild-essential-arm64
+      
+      - name: Build Debian packages with bindeb-pkg
         run: |
           set -euxo pipefail
           cd linux
-          fakeroot make-kpkg \
-            --initrd \
-            --cross-compile aarch64-linux-gnu- \
-            --arch arm64 \
-            --append-to-version -msm8916-ufi001c \
-            --revision 1.4 \
-            kernel_image kernel_headers
+      
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+      
+          fakeroot make -j"$(nproc)" \
+            bindeb-pkg \
+            KDEB_PKGVERSION=1.4 \
+            LOCALVERSION=-msm8916-ufi001c
+      
       - name: Collect artifacts
         run: |
           set -euxo pipefail
           mkdir -p artifacts
-          cp -v ./*.deb artifacts/ || true
+          find linux/.. -maxdepth 1 -type f -name "*.deb" -exec cp -v {} artifacts/ \; || true
+          find linux/.. -maxdepth 1 -type f -name "*.changes" -exec cp -v {} artifacts/ \; || true
+          find linux/.. -maxdepth 1 -type f -name "*.buildinfo" -exec cp -v {} artifacts/ \; || true
           cp -v linux/arch/arm64/boot/Image.gz artifacts/ || true
 
     

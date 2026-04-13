@@ -1,4 +1,4 @@
-name: build-msm8916-linux-v7-full
+name: build-msm8916-linux-v7-full-20.04
 
 on:
   workflow_dispatch:
@@ -36,7 +36,7 @@ on:
       rootfs_grow_mb:
         description: "安装新内核前，给 rootfs 扩容多少 MB（0 表示不扩容）"
         required: true
-        default: "2048"
+        default: "0"
 
       boot_base:
         description: "mkbootimg --base"

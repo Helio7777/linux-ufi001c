@@ -404,12 +404,13 @@ jobs:
           set -euxo pipefail
           make -C linux \
             O="$PWD/build" \
-            ARCH="$ARCH" \
-            CROSS_COMPILE="$CROSS_COMPILE" \
-            LOCALVERSION="$LOCALVERSION" \
-            KBUILD_DEBARCH="$KBUILD_DEBARCH" \
-            KDEB_PKGVERSION="1.${GITHUB_RUN_NUMBER}" \
-            KDEB_SOURCENAME="linux-upstream-msm8916" \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LOCALVERSION=-msm8916-ufi001c \
+            KBUILD_DEBARCH=arm64 \
+            KDEB_PKGVERSION=1.4 \
+            KDEB_SOURCENAME=linux-upstream-msm8916 \
+            DPKG_FLAGS=-d \
             -j"$(nproc)" \
             bindeb-pkg
 

@@ -1,0 +1,502 @@
+name: build-msm8916-linux-v7-full
+
+on:
+  workflow_dispatch:
+    inputs:
+      old_kernel_repo:
+        description: "原 5.15 内核仓库地址"
+        required: true
+        default: "https://github.com/OpenStick/linux.git"
+
+      old_kernel_ref:
+        description: "原 5.15 分支或 tag（按你的项目实际修改）"
+        required: true
+        default: "master"
+
+      old_defconfig:
+        description: "原项目 defconfig 名称"
+        required: true
+        default: "msm8916_defconfig"
+
+      new_kernel_ref:
+        description: "主线 Linux 版本"
+        required: true
+        default: "v7.0"
+
+      device_dtb:
+        description: "目标 DTB 相对路径"
+        required: true
+        default: "arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb"
+
+      rootfs_zip_url:
+        description: "debian.zip 下载地址（zip 内含 rootfs.img）"
+        required: true
+        default: "https://github.com/OpenStick/OpenStick/releases/download/v1/debian.zip"
+
+      rootfs_grow_mb:
+        description: "安装新内核前，给 rootfs 扩容多少 MB（0 表示不扩容）"
+        required: true
+        default: "2048"
+
+      boot_base:
+        description: "mkbootimg --base"
+        required: true
+        default: "0x80000000"
+
+      boot_kernel_offset:
+        description: "mkbootimg --kernel_offset"
+        required: true
+        default: "0x00080000"
+
+      boot_ramdisk_offset:
+        description: "mkbootimg --ramdisk_offset"
+        required: true
+        default: "0x02000000"
+
+      boot_tags_offset:
+        description: "mkbootimg --tags_offset"
+        required: true
+        default: "0x01e00000"
+
+      boot_second_offset:
+        description: "mkbootimg --second_offset"
+        required: true
+        default: "0x00f00000"
+
+      boot_pagesize:
+        description: "mkbootimg --pagesize"
+        required: true
+        default: "2048"
+
+      boot_cmdline:
+        description: "内核 cmdline，必须改成你设备实际 root= 参数"
+        required: true
+        default: "earlycon root=PARTUUID=a7ab80e8-e9d1-e8cd-f157-93f69b1d141e console=ttyMSM0,115200 no_framebuffer=true rw"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      KBUILD_DEBARCH: arm64
+      LOCALVERSION: -msm8916-ufi001c
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            curl \
+            wget \
+            unzip \
+            rsync \
+            bc \
+            bison \
+            flex \
+            build-essential \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            libssl-dev \
+            libelf-dev \
+            libncurses-dev \
+            pahole \
+            cpio \
+            fakeroot \
+            dpkg-dev \
+            debhelper \
+            devscripts \
+            kmod \
+            xz-utils \
+            zstd \
+            python3 \
+            qemu-user-static \
+            binfmt-support \
+            e2fsprogs \
+            fdisk \
+            util-linux \
+            android-sdk-libsparse-utils \
+            mkbootimg
+
+      - name: Prepare directories
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts/kernel artifacts/deb artifacts/config artifacts/rootfs work
+
+      - name: Create v7 fragment
+        run: |
+          cat > work/msm8916-v7.fragment <<'EOF'
+          CONFIG_LOCALVERSION="-msm8916-ufi001c"
+
+          CONFIG_IKCONFIG=y
+          CONFIG_IKCONFIG_PROC=y
+
+          CONFIG_BLK_DEV_INITRD=y
+          CONFIG_RD_GZIP=y
+          CONFIG_RD_ZSTD=y
+
+          CONFIG_DEVTMPFS=y
+          CONFIG_DEVTMPFS_MOUNT=y
+          CONFIG_TMPFS=y
+          CONFIG_EXT4_FS=y
+          CONFIG_VFAT_FS=y
+          CONFIG_FHANDLE=y
+
+          CONFIG_ARCH_QCOM=y
+          CONFIG_QCOM_SMEM=y
+          CONFIG_QCOM_SMEM_STATE=y
+
+          CONFIG_SERIAL_MSM=y
+          CONFIG_SERIAL_MSM_CONSOLE=y
+          CONFIG_SERIAL_OF_PLATFORM=y
+
+          CONFIG_MMC=y
+          CONFIG_MMC_BLOCK=y
+          CONFIG_MMC_SDHCI=y
+          CONFIG_MMC_SDHCI_PLTFM=y
+          CONFIG_MMC_SDHCI_MSM=y
+          EOF
+
+      - name: Clone old 5.15 kernel tree
+        run: |
+          set -euxo pipefail
+          git clone --depth=1 --branch "${{ inputs.old_kernel_ref }}" \
+            "${{ inputs.old_kernel_repo }}" linux-old
+
+      - name: Expand old 5.15 defconfig to full .config
+        run: |
+          set -euxo pipefail
+          mkdir -p build-old
+          make -C linux-old \
+            O="$PWD/build-old" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            ${{ inputs.old_defconfig }} olddefconfig
+
+          test -f build-old/.config
+          cp build-old/.config artifacts/config/old-5.15.full.config
+          cp build-old/.config work/old-5.15.full.config
+
+      - name: Clone torvalds/linux
+        run: |
+          set -euxo pipefail
+          git clone --depth=1 --branch "${{ inputs.new_kernel_ref }}" \
+            https://github.com/torvalds/linux.git linux
+
+      - name: Generate v7.0 config from old full config
+        run: |
+          set -euxo pipefail
+          mkdir -p build
+
+          make -C linux \
+            O="$PWD/build" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            defconfig
+
+          KCONFIG_CONFIG="$PWD/build/.config" \
+            bash linux/scripts/kconfig/merge_config.sh \
+              -m -r \
+              -O "$PWD/build" \
+              "$PWD/build/.config" \
+              "$PWD/work/old-5.15.full.config" \
+              "$PWD/work/msm8916-v7.fragment"
+
+          make -C linux \
+            O="$PWD/build" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            LOCALVERSION="$LOCALVERSION" \
+            olddefconfig
+
+          cp build/.config artifacts/config/linux-7.0.msm8916.config
+
+      - name: Save minimized defconfig
+        run: |
+          set -euxo pipefail
+          make -C linux \
+            O="$PWD/build" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            savedefconfig
+
+          cp build/defconfig artifacts/config/linux-7.0.msm8916.defconfig
+
+      - name: Audit critical config
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def parse(path):
+              cfg = {}
+              for line in Path(path).read_text().splitlines():
+                  if line.startswith("CONFIG_") and "=" in line:
+                      k, v = line.split("=", 1)
+                      cfg[k] = v
+                  elif line.startswith("# CONFIG_") and line.endswith("is not set"):
+                      k = line.split()[1]
+                      cfg[k] = "n"
+              return cfg
+
+          old = parse("artifacts/config/old-5.15.full.config")
+          new = parse("build/.config")
+
+          dropped = []
+          for k, v in sorted(old.items()):
+              if v in ("y", "m") and new.get(k, "n") == "n":
+                  dropped.append(f"{k}: {v} -> n")
+
+          Path("artifacts/config/dropped-enabled-symbols.txt").write_text(
+              ("\n".join(dropped) + "\n") if dropped else ""
+          )
+
+          critical = [
+              "CONFIG_ARCH_QCOM",
+              "CONFIG_SERIAL_MSM",
+              "CONFIG_SERIAL_MSM_CONSOLE",
+              "CONFIG_DEVTMPFS",
+              "CONFIG_DEVTMPFS_MOUNT",
+              "CONFIG_BLK_DEV_INITRD",
+              "CONFIG_EXT4_FS",
+              "CONFIG_TMPFS",
+              "CONFIG_MMC",
+              "CONFIG_MMC_SDHCI",
+              "CONFIG_MMC_SDHCI_MSM",
+          ]
+
+          bad = [k for k in critical if new.get(k) != "y"]
+          if bad:
+              print("Critical config missing:", ", ".join(bad))
+              raise SystemExit(1)
+          PY
+
+      - name: Build kernel, dtbs and modules
+        run: |
+          set -euxo pipefail
+          make -C linux \
+            O="$PWD/build" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            LOCALVERSION="$LOCALVERSION" \
+            -j"$(nproc)" \
+            Image.gz dtbs modules
+
+          test -f "build/${{ inputs.device_dtb }}"
+
+          cp build/arch/arm64/boot/Image.gz artifacts/kernel/
+          cp "build/${{ inputs.device_dtb }}" artifacts/kernel/
+          cp build/vmlinux artifacts/kernel/
+          cp build/System.map artifacts/kernel/
+          cp build/.config artifacts/kernel/kernel.config
+
+          cat build/arch/arm64/boot/Image.gz "build/${{ inputs.device_dtb }}" > artifacts/kernel/kernel-dtb
+
+      - name: Build Debian packages
+        run: |
+          set -euxo pipefail
+          make -C linux \
+            O="$PWD/build" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            LOCALVERSION="$LOCALVERSION" \
+            KBUILD_DEBARCH="$KBUILD_DEBARCH" \
+            KDEB_PKGVERSION="1.${GITHUB_RUN_NUMBER}" \
+            KDEB_SOURCENAME="linux-upstream-msm8916" \
+            -j"$(nproc)" \
+            bindeb-pkg
+
+      - name: Collect Debian packages
+        run: |
+          set -euxo pipefail
+          find "$GITHUB_WORKSPACE" -maxdepth 1 -type f \
+            \( -name "*.deb" -o -name "*.changes" -o -name "*.buildinfo" \) \
+            -exec cp -t artifacts/deb {} +
+
+          ls -lah artifacts/deb
+
+      - name: Download and extract debian.zip
+        run: |
+          set -euxo pipefail
+          cd work
+          curl -L "${{ inputs.rootfs_zip_url }}" -o debian.zip
+          unzip -q debian.zip -d debian_zip
+
+          ROOTFS_IMG="$(find debian_zip -type f -name 'rootfs.img' | head -n1 || true)"
+          if [ -z "$ROOTFS_IMG" ]; then
+            ROOTFS_IMG="$(find debian_zip -type f -name '*.img' | head -n1 || true)"
+          fi
+
+          if [ -z "$ROOTFS_IMG" ]; then
+            echo "No rootfs.img found in debian.zip"
+            exit 1
+          fi
+
+          echo "ROOTFS_IMG=$ROOTFS_IMG" >> "$GITHUB_ENV"
+          ls -lah "$ROOTFS_IMG"
+
+      - name: Install kernel debs into rootfs and extract initrd
+        run: |
+          set -euxo pipefail
+
+          mkdir -p /tmp/rootfs-mnt
+
+          # 将 sparse image 转换成 raw；如果本来就是 raw，则直接复制
+          if simg2img "$ROOTFS_IMG" work/root.img 2>/dev/null; then
+            echo "Converted sparse rootfs.img to raw root.img"
+          else
+            cp "$ROOTFS_IMG" work/root.img
+            echo "rootfs.img is already raw, copied to work/root.img"
+          fi
+
+          # 如果是单 ext4 文件系统镜像，并且指定了扩容，就先扩容
+          if [ "${{ inputs.rootfs_grow_mb }}" != "0" ]; then
+            if blkid -p work/root.img | grep -q 'TYPE="ext4"'; then
+              truncate -s +"${{ inputs.rootfs_grow_mb }}M" work/root.img
+              e2fsck -fy work/root.img || true
+              resize2fs work/root.img
+            else
+              echo "root.img is not a plain ext4 filesystem image, skip resize"
+            fi
+          fi
+
+          LOOPDEV=""
+          ROOTDEV=""
+
+          cleanup() {
+            set +e
+            sync
+            sudo umount /tmp/rootfs-mnt/proc 2>/dev/null || true
+            sudo umount /tmp/rootfs-mnt/dev/pts 2>/dev/null || true
+            sudo umount /tmp/rootfs-mnt/dev 2>/dev/null || true
+            sudo umount /tmp/rootfs-mnt/sys 2>/dev/null || true
+            sudo umount /tmp/rootfs-mnt 2>/dev/null || true
+            if [ -n "${LOOPDEV:-}" ]; then
+              sudo losetup -d "$LOOPDEV" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          LOOPDEV="$(sudo losetup --find --show --partscan work/root.img)"
+          echo "LOOPDEV=$LOOPDEV"
+
+          if ls ${LOOPDEV}p* >/dev/null 2>&1; then
+            ROOTDEV="$(ls ${LOOPDEV}p* | head -n1)"
+          else
+            ROOTDEV="$LOOPDEV"
+          fi
+          echo "ROOTDEV=$ROOTDEV"
+
+          sudo mount "$ROOTDEV" /tmp/rootfs-mnt
+
+          sudo mkdir -p /tmp/rootfs-mnt/root
+          sudo mkdir -p /tmp/rootfs-mnt/usr/bin
+
+          sudo cp /usr/bin/qemu-aarch64-static /tmp/rootfs-mnt/usr/bin/
+          sudo cp artifacts/deb/*.deb /tmp/rootfs-mnt/root/
+          sudo cp /etc/resolv.conf /tmp/rootfs-mnt/etc/resolv.conf || true
+
+          sudo mount --bind /proc /tmp/rootfs-mnt/proc
+          sudo mount --bind /dev /tmp/rootfs-mnt/dev
+          sudo mount --bind /dev/pts /tmp/rootfs-mnt/dev/pts
+          sudo mount --bind /sys /tmp/rootfs-mnt/sys
+
+          sudo chroot /tmp/rootfs-mnt /usr/bin/qemu-aarch64-static /bin/bash -eux <<'CHROOT'
+          export DEBIAN_FRONTEND=noninteractive
+          export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+          cat > /usr/sbin/policy-rc.d <<'EOF'
+          #!/bin/sh
+          exit 101
+          EOF
+          chmod +x /usr/sbin/policy-rc.d
+
+          apt-get update || true
+          apt-get install -y --no-install-recommends initramfs-tools busybox kmod udev || true
+
+          if ! command -v update-initramfs >/dev/null 2>&1; then
+            echo "update-initramfs not found in rootfs"
+            exit 1
+          fi
+
+          OLDPKGS="$(dpkg-query -W -f='${Package}\n' 2>/dev/null | grep -E '^linux-(image|headers)-' || true)"
+          if [ -n "$OLDPKGS" ]; then
+            apt-get purge -y $OLDPKGS || true
+          fi
+
+          dpkg -i /root/linux-image-*.deb || apt-get -f install -y
+          if ls /root/linux-headers-*.deb >/dev/null 2>&1; then
+            dpkg -i /root/linux-headers-*.deb || apt-get -f install -y
+          fi
+
+          NEW_KVER="$(basename "$(ls -1dt /lib/modules/* | head -n1)")"
+          echo "NEW_KVER=$NEW_KVER"
+
+          depmod "$NEW_KVER" || true
+          update-initramfs -c -k "$NEW_KVER" || update-initramfs -u -k "$NEW_KVER"
+
+          ls -lah /boot
+          rm -f /usr/sbin/policy-rc.d
+          CHROOT
+
+          INITRD="$(ls -1t /tmp/rootfs-mnt/boot/initrd.img-* | head -n1)"
+          test -f "$INITRD"
+
+          sudo cp "$INITRD" artifacts/kernel/initrd.img
+
+          # 先清理挂载，再重新打包 rootfs
+          cleanup
+          trap - EXIT
+
+          if img2simg work/root.img artifacts/rootfs/rootfs.img 2>/dev/null; then
+            echo "Converted raw root.img back to sparse rootfs.img"
+          else
+            cp work/root.img artifacts/rootfs/rootfs.img
+            echo "img2simg failed or unavailable, keeping raw rootfs.img"
+          fi
+
+          sudo chown -R "$USER":"$USER" artifacts
+
+      - name: Generate boot.img
+        run: |
+          set -euxo pipefail
+
+          test -f artifacts/kernel/kernel-dtb
+          test -f artifacts/kernel/initrd.img
+
+          mkbootimg \
+            --base "${{ inputs.boot_base }}" \
+            --kernel_offset "${{ inputs.boot_kernel_offset }}" \
+            --ramdisk_offset "${{ inputs.boot_ramdisk_offset }}" \
+            --tags_offset "${{ inputs.boot_tags_offset }}" \
+            --pagesize "${{ inputs.boot_pagesize }}" \
+            --second_offset "${{ inputs.boot_second_offset }}" \
+            --ramdisk artifacts/kernel/initrd.img \
+            --cmdline "${{ inputs.boot_cmdline }}" \
+            --kernel artifacts/kernel/kernel-dtb \
+            -o artifacts/kernel/boot.img
+
+          ls -lah artifacts/kernel/boot.img
+
+      - name: Generate SHA256
+        run: |
+          set -euxo pipefail
+          (
+            cd artifacts
+            find . -type f -print0 | sort -z | xargs -0 sha256sum
+          ) > artifacts/SHA256SUMS.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: msm8916-linux-${{ inputs.new_kernel_ref }}-${{ github.run_number }}
+          path: artifacts
+          if-no-files-found: error

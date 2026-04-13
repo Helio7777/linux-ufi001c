@@ -82,7 +82,6 @@ jobs:
     env:
       ARCH: arm64
       CROSS_COMPILE: aarch64-linux-gnu-
-      KBUILD_DEBARCH: arm64
       LOCALVERSION: -msm8916-ufi001c
 
     steps:
@@ -427,7 +426,6 @@ jobs:
             O="$PWD/build" \
             ARCH="$ARCH" \
             CROSS_COMPILE="$CROSS_COMPILE" \
-            KBUILD_DEBARCH="$KBUILD_DEBARCH" \
             LOCALVERSION="$LOCALVERSION" \
             -j"$(nproc)" \
             bindeb-pkg \

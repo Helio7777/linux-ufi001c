@@ -1,4 +1,4 @@
-name: build-msm8916-linux-v7-full
+name: build-msm8916-linux-v7-full-arm64
 
 on:
   workflow_dispatch:

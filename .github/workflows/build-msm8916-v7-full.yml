@@ -398,21 +398,6 @@ jobs:
 
           cat build/arch/arm64/boot/Image.gz "build/${{ inputs.device_dtb }}" > artifacts/kernel/kernel-dtb
 
-      - name: Install bindeb-pkg build deps from generated control
-        run: |
-          set -euxo pipefail
-
-          make -C linux \
-            O="$PWD/build" \
-            ARCH="$ARCH" \
-            CROSS_COMPILE="$CROSS_COMPILE" \
-            LOCALVERSION="$LOCALVERSION" \
-            debian
-
-          sudo mk-build-deps -i -r \
-            -t "apt-get -y --no-install-recommends" \
-            build/debian/control
-
 
       - name: Build Debian packages
         run: |

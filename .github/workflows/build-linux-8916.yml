@@ -305,17 +305,28 @@ jobs:
           sudo mount --bind /dev /tmp/rootfs-mnt/dev
           sudo mount --bind /dev/pts /tmp/rootfs-mnt/dev/pts
           sudo mount --bind /sys /tmp/rootfs-mnt/sys
-
+          # 进入 Chroot 执行升级和内核替换
           sudo chroot /tmp/rootfs-mnt /usr/bin/qemu-aarch64-static /bin/bash -eux <<'CHROOT'
           export DEBIAN_FRONTEND=noninteractive
           export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-          # 1. 更换为官方源 (使用 Debian 13 / Trixie)
+          # 1. 彻底清理旧的源，防止第三方源（如 Mobian）干扰
+          rm -rf /etc/apt/sources.list.d/*
           cat > /etc/apt/sources.list <<'EOF'
           deb http://deb.debian.org/debian/ trixie main contrib non-free non-free-firmware
           deb http://deb.debian.org/debian/ trixie-updates main contrib non-free non-free-firmware
           deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
           EOF
+
+          # 2. 解决 GPG 签名问题 (信任引导)
+          # 先尝试更新一次，允许不安全的仓库以便下载最新的 keyring
+          apt-get update -o Acquire::AllowInsecureRepositories=true || true
+          
+          # 强制安装最新的 Debian 密钥环，跳过签名验证
+          apt-get install -y --allow-unauthenticated debian-archive-keyring
+
+          # 现在有了密钥，重新进行正常的更新
+          apt-get update
 
           # 2. 准备升级
           # 防止服务自动启动

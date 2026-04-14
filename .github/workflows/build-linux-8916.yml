@@ -408,7 +408,6 @@ jobs:
 
           # 使用下载的脚本进行打包
           python3 mkbootimg.py \
-          #mkbootimg \
             --base "${{ inputs.boot_base }}" \
             --kernel_offset "${{ inputs.boot_kernel_offset }}" \
             --ramdisk_offset "${{ inputs.boot_ramdisk_offset }}" \

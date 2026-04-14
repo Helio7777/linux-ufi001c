@@ -399,7 +399,8 @@ jobs:
           set -euxo pipefail
           
           # 修复下载命令：去掉 -o 参数，正确解码 Base64
-          curl -sL "https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/heads/main/mkbootimg.py?format=TEXT" | base64 -d > mkbootimg.py
+          # 从 Android 11 分支下载单文件版 mkbootimg.py (无 gki 依赖)
+          curl -sL "https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/tags/android-11.0.0_r1/mkbootimg.py?format=TEXT" | base64 -d > mkbootimg.py
           chmod +x mkbootimg.py
 
           test -f artifacts/kernel/kernel-dtb

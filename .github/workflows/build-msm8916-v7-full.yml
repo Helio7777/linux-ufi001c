@@ -422,6 +422,7 @@ jobs:
         run: |
           set -euxo pipefail
           test -f build/.config
+          # 增加 KDEB_COMPRESS=xz 环境变量
           fakeroot make -C linux \
             O="$PWD/build" \
             ARCH="$ARCH" \
@@ -430,6 +431,7 @@ jobs:
             -j"$(nproc)" \
             bindeb-pkg \
             KDEB_PKGVERSION=1.4 \
+            KDEB_COMPRESS=xz \
             DPKG_FLAGS="-d"
       
       - name: Collect Debian package artifacts
@@ -533,37 +535,50 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
+          # 1. 更换为官方源 (使用 Debian 13 / Trixie)
+          cat > /etc/apt/sources.list <<'EOF'
+          deb http://deb.debian.org/debian/ trixie main contrib non-free non-free-firmware
+          deb http://deb.debian.org/debian/ trixie-updates main contrib non-free non-free-firmware
+          deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
+          EOF
+
+          # 2. 准备升级
+          # 防止服务自动启动
           cat > /usr/sbin/policy-rc.d <<'EOF'
           #!/bin/sh
           exit 101
           EOF
           chmod +x /usr/sbin/policy-rc.d
 
-          apt-get update || true
-          apt-get install -y --no-install-recommends initramfs-tools busybox kmod udev || true
+          # 执行大规模版本升级
+          apt-get update
+          apt-get dist-upgrade -y -o Dpkg::Options::="--force-confold"
 
-          if ! command -v update-initramfs >/dev/null 2>&1; then
-            echo "update-initramfs not found in rootfs"
-            exit 1
-          fi
+          # 3. 安装必要工具（Debian 13 之后建议确保安装 initramfs-tools）
+          apt-get install -y --no-install-recommends initramfs-tools busybox kmod udev
 
+          # 4. 清理旧内核（此时你的 grep 逻辑会清理掉旧的 5.15）
           OLDPKGS="$(dpkg-query -W -f='${Package}\n' 2>/dev/null | grep -E '^linux-(image|headers)-' || true)"
           if [ -n "$OLDPKGS" ]; then
             apt-get purge -y $OLDPKGS || true
           fi
 
-          dpkg -i /root/linux-image-*.deb || apt-get -f install -y
-          if ls /root/linux-headers-*.deb >/dev/null 2>&1; then
-            dpkg -i /root/linux-headers-*.deb || apt-get -f install -y
+          # 5. 安装你自己编译的新内核 (.deb 现在是 XZ 压缩，Debian 13 肯定能识别)
+          # 注意：这里如果 dpkg 失败，set -e 会让脚本报错停止，方便排查
+          dpkg -i /root/linux-image-7.0.0-*.deb
+          if ls /root/linux-headers-7.0.0-*.deb >/dev/null 2>&1; then
+            dpkg -i /root/linux-headers-7.0.0-*.deb
           fi
 
-          NEW_KVER="$(basename "$(ls -1dt /lib/modules/* | head -n1)")"
+          # 6. 获取新内核版本号并生成 initrd
+          # 查找刚安装的 7.0.0 目录
+          NEW_KVER="$(basename "$(ls -1dt /lib/modules/7.0.0* | head -n1)")"
           echo "NEW_KVER=$NEW_KVER"
 
-          depmod "$NEW_KVER" || true
-          update-initramfs -c -k "$NEW_KVER" || update-initramfs -u -k "$NEW_KVER"
+          depmod "$NEW_KVER"
+          update-initramfs -c -k "$NEW_KVER"
 
-          ls -lah /boot
+          # 清理工作
           rm -f /usr/sbin/policy-rc.d
           CHROOT
 
@@ -589,10 +604,15 @@ jobs:
         run: |
           set -euxo pipefail
 
+          # 下载 AOSP 官方仓库中的 mkbootimg 脚本
+          curl -Lo mkbootimg.py https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/heads/main/mkbootimg.py?format=TEXT | base64 -d > mkbootimg.py
+          chmod +x mkbootimg.py
+
           test -f artifacts/kernel/kernel-dtb
           test -f artifacts/kernel/initrd.img
 
-          mkbootimg \
+          # 使用下载的脚本进行打包
+          python3 mkbootimg.py \
             --base "${{ inputs.boot_base }}" \
             --kernel_offset "${{ inputs.boot_kernel_offset }}" \
             --ramdisk_offset "${{ inputs.boot_ramdisk_offset }}" \
@@ -603,6 +623,8 @@ jobs:
             --cmdline "${{ inputs.boot_cmdline }}" \
             --kernel artifacts/kernel/kernel-dtb \
             -o artifacts/kernel/boot.img
+
+          ls -lah artifacts/kernel/boot.img
 
           ls -lah artifacts/kernel/boot.img
 

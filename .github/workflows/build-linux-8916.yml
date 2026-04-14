@@ -397,17 +397,17 @@ jobs:
       - name: Generate boot.img
         run: |
           set -euxo pipefail
-
-          # 下载 AOSP 官方仓库中的 mkbootimg 脚本
-          curl -Lo mkbootimg.py https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/heads/main/mkbootimg.py?format=TEXT | base64 -d > mkbootimg.py
+          
+          # 修复下载命令：去掉 -o 参数，正确解码 Base64
+          curl -sL "https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/heads/main/mkbootimg.py?format=TEXT" | base64 -d > mkbootimg.py
           chmod +x mkbootimg.py
 
           test -f artifacts/kernel/kernel-dtb
           test -f artifacts/kernel/initrd.img
 
           # 使用下载的脚本进行打包
-          #python3 mkbootimg.py \
-          mkbootimg \
+          python3 mkbootimg.py \
+          #mkbootimg \
             --base "${{ inputs.boot_base }}" \
             --kernel_offset "${{ inputs.boot_kernel_offset }}" \
             --ramdisk_offset "${{ inputs.boot_ramdisk_offset }}" \

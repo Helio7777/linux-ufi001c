@@ -327,6 +327,14 @@ jobs:
 
           # 现在有了密钥，重新进行正常的更新
           apt-get update
+          # 【新增：修复 mobian-tweaks-common 卸载失败的问题】
+          # 强制让报错的 prerm 脚本失效
+          if [ -f /var/lib/dpkg/info/mobian-tweaks-common.prerm ]; then
+            echo "#!/bin/sh" > /var/lib/dpkg/info/mobian-tweaks-common.prerm
+            echo "exit 0" >> /var/lib/dpkg/info/mobian-tweaks-common.prerm
+          fi
+          # 强制移除 Mobian 相关可能冲突的包
+          apt-get purge -y mobian-tweaks-common mobian-keyring || true
 
           # 2. 准备升级
           # 防止服务自动启动

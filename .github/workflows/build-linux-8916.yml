@@ -374,6 +374,7 @@ jobs:
 
           # 清理工作
           rm -f /usr/sbin/policy-rc.d
+          apt autoremove -y
           CHROOT
 
           INITRD="$(ls -1t /tmp/rootfs-mnt/boot/initrd.img-* | head -n1)"

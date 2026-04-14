@@ -131,12 +131,13 @@ jobs:
             msm8916_defconfig
 
           # 合并旧配置和额外的碎片配置
-          KCONFIG_CONFIG="$PWD/build/.config" \
-            bash linux/scripts/kconfig/merge_config.sh \
-            -m -r -O "$PWD/build" \
-            "$PWD/build/.config" \
-            "$PWD/work/old-5.15.full.config" \
-            "${{ github.workspace }}/config/frag.config" || true
+          #KCONFIG_CONFIG="$PWD/build/.config" \
+          #  bash linux/scripts/kconfig/merge_config.sh \
+          #  -m -r -O "$PWD/build" \
+          #  "$PWD/build/.config" \
+          #  "$PWD/work/old-5.15.full.config"  || true
+          #  #"${{ github.workspace }}/config/frag.config" || true
+          cp "$PWD/work/old-5.15.full.config" "$PWD/build/.config"
 
           make -C linux O="$PWD/build" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
             LOCALVERSION="$LOCALVERSION" olddefconfig

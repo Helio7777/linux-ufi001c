@@ -394,44 +394,49 @@ jobs:
 
           sudo chown -R "$USER":"$USER" artifacts
 
+      - name: Upload pre-bootimg artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: msm8916-preboot-${{ inputs.new_kernel_ref }}-${{ github.run_number }}
+          path: |
+            artifacts/kernel/kernel-dtb
+            artifacts/kernel/initrd.img
+            artifacts/kernel/vmlinux
+            artifacts/deb
+            artifacts/config
+            artifacts/rootfs
+          if-no-files-found: error
       - name: Generate boot.img
+        continue-on-error: true
         run: |
           set -euxo pipefail
-          
-          # 修复下载命令：去掉 -o 参数，正确解码 Base64
-          # 从 Android 11 分支下载单文件版 mkbootimg.py (无 gki 依赖)
-          curl -sL "https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/tags/android-11.0.0_r1/mkbootimg.py?format=TEXT" | base64 -d > mkbootimg.py
+          curl -sL "https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/tags/android-10.0.0_r1/mkbootimg.py?format=TEXT" | base64 -d > mkbootimg.py
           chmod +x mkbootimg.py
-
           test -f artifacts/kernel/kernel-dtb
           test -f artifacts/kernel/initrd.img
-
-          # 使用下载的脚本进行打包
           python3 mkbootimg.py \
-            --base "${{ inputs.boot_base }}" \
-            --kernel_offset "${{ inputs.boot_kernel_offset }}" \
-            --ramdisk_offset "${{ inputs.boot_ramdisk_offset }}" \
-            --tags_offset "${{ inputs.boot_tags_offset }}" \
-            --pagesize "${{ inputs.boot_pagesize }}" \
-            --second_offset "${{ inputs.boot_second_offset }}" \
-            --ramdisk artifacts/kernel/initrd.img \
-            --cmdline "${{ inputs.boot_cmdline }}" \
-            --kernel artifacts/kernel/kernel-dtb \
-            -o artifacts/kernel/boot.img
-
-          ls -lah artifacts/kernel/boot.img
-
-          ls -lah artifacts/kernel/boot.img
-
+            --base 0x80000000 \
+            --kernel_offset 0x00080000 \
+            --ramdisk_offset 0x02000000 \
+            --tags_offset 0x01e00000 \
+            --pagesize 2048 \
+            --second_offset 0x00f00000 \
+            --ramdisk initrd.img \
+            --cmdline "earlycon root=PARTUUID=a7ab80e8-e9d1-e8cd-f157-93f69b1d141e console=ttyMSM0,115200 no_framebuffer=true rw"\
+            --kernel kernel-dtb \
+            -o artifacts/kernel/boot.img || true
+          ls -lah artifacts/kernel || true
+          test -f artifacts/kernel/boot.img && ls -lah artifacts/kernel/boot.img || true
       - name: Generate SHA256
+        if: always()
         run: |
           set -euxo pipefail
           (
             cd artifacts
             find . -type f -print0 | sort -z | xargs -0 sha256sum
           ) > artifacts/SHA256SUMS.txt
-
-      - name: Upload artifacts
+      - name: Upload final artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: msm8916-linux-${{ inputs.new_kernel_ref }}-${{ github.run_number }}

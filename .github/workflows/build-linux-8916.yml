@@ -1,0 +1,301 @@
+name: build-msm8916-linux-v6.12-full
+
+on:
+  workflow_dispatch:
+    inputs:
+      old_kernel_repo:
+        description: "原 5.15 内核仓库地址"
+        required: true
+        default: "https://github.com/OpenStick/linux.git"
+
+      old_kernel_ref:
+        description: "原 5.15 分支或 tag"
+        required: true
+        default: "master"
+
+      old_defconfig:
+        description: "原项目 defconfig 名称"
+        required: true
+        default: "msm8916_defconfig"
+
+      new_kernel_repo:
+        description: "主线内核仓库"
+        required: true
+        default: "https://github.com/msm8916-mainline/linux.git"
+
+      new_kernel_ref:
+        description: "主线内核分支或 tag"
+        required: true
+        default: "v6.12.1-msm8916"
+
+      device_dtb:
+        description: "目标 DTB 相对路径"
+        required: true
+        default: "arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb"
+
+      rootfs_zip_url:
+        description: "debian.zip 下载地址"
+        required: true
+        default: "https://github.com/OpenStick/OpenStick/releases/download/v1/debian.zip"
+
+      rootfs_grow_mb:
+        description: "rootfs 扩容 (MB)"
+        required: true
+        default: "2048"
+
+      boot_base:
+        description: "mkbootimg --base"
+        required: true
+        default: "0x80000000"
+
+      boot_kernel_offset:
+        description: "mkbootimg --kernel_offset"
+        required: true
+        default: "0x00080000"
+
+      boot_ramdisk_offset:
+        description: "mkbootimg --ramdisk_offset"
+        required: true
+        default: "0x02000000"
+
+      boot_tags_offset:
+        description: "mkbootimg --tags_offset"
+        required: true
+        default: "0x01e00000"
+
+      boot_pagesize:
+        description: "mkbootimg --pagesize"
+        required: true
+        default: "2048"
+
+      boot_cmdline:
+        description: "内核 cmdline"
+        required: true
+        default: "earlycon root=PARTUUID=a7ab80e8-e9d1-e8cd-f157-93f69b1d141e console=ttyMSM0,115200 no_framebuffer=true rw"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      LOCALVERSION: -msm8916-mainline
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl wget unzip rsync bc bison flex build-essential \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libssl-dev libelf-dev libdw-dev libncurses-dev pahole \
+            cpio fakeroot dpkg-dev debhelper devscripts equivs kmod \
+            xz-utils zstd python3 qemu-user-static binfmt-support \
+            e2fsprogs fdisk util-linux android-sdk-libsparse-utils \
+            mkbootimg dwarves crossbuild-essential-arm64
+
+      - name: Prepare directories
+        run: mkdir -p artifacts/kernel artifacts/deb artifacts/config artifacts/rootfs work
+
+      - name: Clone old 5.15 kernel tree
+        run: |
+          git clone --depth=1 --branch "${{ inputs.old_kernel_ref }}" \
+            "${{ inputs.old_kernel_repo }}" linux-old
+
+      - name: Expand old 5.15 defconfig
+        run: |
+          set -euxo pipefail
+          mkdir -p build-old
+          make -C linux-old O="$PWD/build-old" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+            ${{ inputs.old_defconfig }} olddefconfig
+          cp build-old/.config work/old-5.15.full.config
+
+      - name: Clone msm8916-mainline linux
+        run: |
+          git clone --depth=1 --branch "${{ inputs.new_kernel_ref }}" \
+            "${{ inputs.new_kernel_repo }}" linux
+
+      - name: Generate v6.12 config
+        run: |
+          set -euxo pipefail
+          mkdir -p build
+          # 使用新仓库自带的 msm8916_defconfig 作为基准
+          make -C linux O="$PWD/build" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+            msm8916_defconfig
+
+          # 合并旧配置和额外的碎片配置
+          KCONFIG_CONFIG="$PWD/build/.config" \
+            bash linux/scripts/kconfig/merge_config.sh \
+            -m -r -O "$PWD/build" \
+            "$PWD/build/.config" \
+            "$PWD/work/old-5.15.full.config" \
+            "${{ github.workspace }}/config/frag.config" || true
+
+          make -C linux O="$PWD/build" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+            LOCALVERSION="$LOCALVERSION" olddefconfig
+          
+          cp build/.config artifacts/config/linux-6.12.msm8916.config
+
+      - name: Audit critical config
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          def parse(path):
+              cfg = {}
+              for line in Path(path).read_text().splitlines():
+                  if line.startswith("CONFIG_") and "=" in line:
+                      k, v = line.split("=", 1)
+                      cfg[k] = v
+              return cfg
+          new = parse("build/.config")
+          critical = ["CONFIG_ARCH_QCOM", "CONFIG_SERIAL_MSM", "CONFIG_MMC_SDHCI_MSM", "CONFIG_EXT4_FS"]
+          bad = [k for k in critical if new.get(k) != "y"]
+          if bad:
+              print(f"Critical config missing: {bad}")
+              exit(1)
+          PY
+
+      - name: Build kernel and modules
+        run: |
+          set -euxo pipefail
+          make -C linux O="$PWD/build" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+            LOCALVERSION="$LOCALVERSION" -j"$(nproc)" Image.gz dtbs modules
+          
+          cat build/arch/arm64/boot/Image.gz "build/${{ inputs.device_dtb }}" > artifacts/kernel/kernel-dtb
+          cp build/vmlinux artifacts/kernel/
+
+      - name: Build Debian packages
+        run: |
+          set -euxo pipefail
+          fakeroot make -C linux O="$PWD/build" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+            LOCALVERSION="$LOCALVERSION" -j"$(nproc)" bindeb-pkg \
+            KDEB_PKGVERSION=1.0-mainline KDEB_COMPRESS=xz DPKG_FLAGS="-d"
+          
+          find . -maxdepth 1 -type f -name "*.deb" -exec cp -v {} artifacts/deb/ \;
+
+      - name: Install kernel debs into rootfs and upgrade to Debian 13
+        run: |
+          set -euxo pipefail
+
+          mkdir -p /tmp/rootfs-mnt
+          # 将 sparse image 转换成 raw
+          if simg2img "$ROOTFS_IMG" work/root.img 2>/dev/null; then
+            echo "Converted sparse rootfs.img to raw root.img"
+          else
+            cp "$ROOTFS_IMG" work/root.img
+          fi
+
+          # 扩容逻辑
+          if [ "${{ inputs.rootfs_grow_mb }}" != "0" ]; then
+            truncate -s +"${{ inputs.rootfs_grow_mb }}M" work/root.img
+            e2fsck -fy work/root.img || true
+            resize2fs work/root.img
+          fi
+
+          LOOPDEV="$(sudo losetup --find --show --partscan work/root.img)"
+          # 自动识别分区或整盘镜像
+          if ls ${LOOPDEV}p* >/dev/null 2>&1; then
+            ROOTDEV="$(ls ${LOOPDEV}p* | head -n1)"
+          else
+            ROOTDEV="$LOOPDEV"
+          fi
+
+          sudo mount "$ROOTDEV" /tmp/rootfs-mnt
+
+          # 准备环境
+          sudo cp /usr/bin/qemu-aarch64-static /tmp/rootfs-mnt/usr/bin/
+          sudo cp artifacts/deb/*.deb /tmp/rootfs-mnt/root/
+          sudo cp /etc/resolv.conf /tmp/rootfs-mnt/etc/resolv.conf || true
+
+          sudo mount --bind /proc /tmp/rootfs-mnt/proc
+          sudo mount --bind /dev /tmp/rootfs-mnt/dev
+          sudo mount --bind /dev/pts /tmp/rootfs-mnt/dev/pts
+          sudo mount --bind /sys /tmp/rootfs-mnt/sys
+
+          # 进入 Chroot 执行升级和内核替换
+          sudo chroot /tmp/rootfs-mnt /usr/bin/qemu-aarch64-static /bin/bash -eux <<'CHROOT'
+          export DEBIAN_FRONTEND=noninteractive
+          export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+          # 1. 更换为 Debian 13 (Trixie) 官方源
+          cat > /etc/apt/sources.list <<'EOF'
+          deb http://deb.debian.org/debian/ trixie main contrib non-free non-free-firmware
+          deb http://deb.debian.org/debian/ trixie-updates main contrib non-free non-free-firmware
+          deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
+          EOF
+
+          # 2. 准备升级环境
+          # 禁用服务自动启动，防止升级过程中某些服务报错
+          cat > /usr/sbin/policy-rc.d <<'EOF'
+          #!/bin/sh
+          exit 101
+          EOF
+          chmod +x /usr/sbin/policy-rc.d
+
+          # 3. 执行系统升级 (从 11 直接跨到 13 可能需要两次，这里强制执行 dist-upgrade)
+          apt-get update
+          apt-get upgrade -y -o Dpkg::Options::="--force-confold"
+          apt-get dist-upgrade -y -o Dpkg::Options::="--force-confold"
+          apt-get autoremove -y
+
+          # 4. 安装必要的底层工具
+          apt-get install -y --no-install-recommends initramfs-tools busybox kmod udev
+
+          # 5. 清理旧内核及其残余 (OpenStick 默认通常带有 5.15)
+          OLDPKGS="$(dpkg-query -W -f='${Package}\n' 2>/dev/null | grep -E '^linux-(image|headers)-' || true)"
+          if [ -n "$OLDPKGS" ]; then
+            apt-get purge -y $OLDPKGS || true
+          fi
+
+          # 6. 安装新编译的 6.12 内核
+          dpkg -i /root/*.deb
+
+          # 7. 生成 Initrd
+          # 动态获取安装的内核版本号
+          NEW_KVER="$(basename "$(ls -1dt /lib/modules/6.12* | head -n1)")"
+          depmod "$NEW_KVER"
+          update-initramfs -c -k "$NEW_KVER"
+
+          # 8. 清理工作
+          rm -f /usr/sbin/policy-rc.d
+          rm -rf /root/*.deb
+          CHROOT
+
+          # 提取新生成的 initrd 给后续打包 boot.img 使用
+          sudo cp /tmp/rootfs-mnt/boot/initrd.img-* artifacts/kernel/initrd.img
+
+          # 卸载
+          sudo sync
+          sudo umount -l /tmp/rootfs-mnt/proc /tmp/rootfs-mnt/dev/pts /tmp/rootfs-mnt/dev /tmp/rootfs-mnt/sys /tmp/rootfs-mnt || true
+          sudo losetup -d "$LOOPDEV" || true
+
+          # 转换回 Sparse 格式
+          img2simg work/root.img artifacts/rootfs/rootfs.img || cp work/root.img artifacts/rootfs/rootfs.img
+
+      - name: Generate boot.img
+        run: |
+          curl -Lo mkbootimg.py https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/heads/main/mkbootimg.py?format=TEXT | base64 -d > mkbootimg.py
+          python3 mkbootimg.py \
+            --base "${{ inputs.boot_base }}" \
+            --kernel_offset "${{ inputs.boot_kernel_offset }}" \
+            --ramdisk_offset "${{ inputs.boot_ramdisk_offset }}" \
+            --tags_offset "${{ inputs.boot_tags_offset }}" \
+            --pagesize "${{ inputs.boot_pagesize }}" \
+            --ramdisk artifacts/kernel/initrd.img \
+            --cmdline "${{ inputs.boot_cmdline }}" \
+            --kernel artifacts/kernel/kernel-dtb \
+            -o artifacts/kernel/boot.img
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: msm8916-mainline-${{ inputs.new_kernel_ref }}
+          path: artifacts

@@ -459,7 +459,8 @@ jobs:
             exit 1
           fi
 
-          echo "ROOTFS_IMG=$ROOTFS_IMG" >> "$GITHUB_ENV"
+          # 【修改这里】使用 $PWD 将其转换为绝对路径再导出
+          echo "ROOTFS_IMG=$PWD/$ROOTFS_IMG" >> "$GITHUB_ENV"
           ls -lah "$ROOTFS_IMG"
 
       - name: Install kernel debs into rootfs and extract initrd

@@ -172,45 +172,131 @@ jobs:
           cat build/arch/arm64/boot/Image.gz "build/${{ inputs.device_dtb }}" > artifacts/kernel/kernel-dtb
           cp build/vmlinux artifacts/kernel/
 
-      - name: Build Debian packages
+      - name: Install build dependencies
         run: |
           set -euxo pipefail
-          fakeroot make -C linux O="$PWD/build" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
-            LOCALVERSION="$LOCALVERSION" -j"$(nproc)" bindeb-pkg \
-            KDEB_PKGVERSION=1.0-mainline KDEB_COMPRESS=xz DPKG_FLAGS="-d"
-          
-          find . -maxdepth 1 -type f -name "*.deb" -exec cp -v {} artifacts/deb/ \;
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            bc \
+            bison \
+            flex \
+            fakeroot \
+            dpkg-dev \
+            debhelper \
+            rsync \
+            kmod \
+            cpio \
+            python3 \
+            libssl-dev \
+            libelf-dev \
+            dwarves \
+            crossbuild-essential-arm64
 
-      - name: Install kernel debs into rootfs and upgrade to Debian 13
+      - name: Build Debian packages with bindeb-pkg
+        run: |
+          set -euxo pipefail
+          test -f build/.config
+          # 增加 KDEB_COMPRESS=xz 环境变量
+          fakeroot make -C linux \
+            O="$PWD/build" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            LOCALVERSION="$LOCALVERSION" \
+            -j"$(nproc)" \
+            bindeb-pkg \
+            KDEB_PKGVERSION=1.4 \
+            KDEB_COMPRESS=xz \
+            DPKG_FLAGS="-d"
+      
+      - name: Collect Debian package artifacts
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts/deb
+          find . -maxdepth 1 -type f -name "*.deb" -exec cp -v {} artifacts/deb/ \;
+          find . -maxdepth 1 -type f -name "*.changes" -exec cp -v {} artifacts/deb/ \; || true
+          find . -maxdepth 1 -type f -name "*.buildinfo" -exec cp -v {} artifacts/deb/ \; || true
+          ls -lah artifacts/deb
+
+    
+      - name: Download and extract debian.zip
+        run: |
+          set -euxo pipefail
+          cd work
+          curl -L "${{ inputs.rootfs_zip_url }}" -o debian.zip
+          unzip -q debian.zip -d debian_zip
+
+          ROOTFS_IMG="$(find debian_zip -type f -name 'rootfs.img' | head -n1 || true)"
+          if [ -z "$ROOTFS_IMG" ]; then
+            ROOTFS_IMG="$(find debian_zip -type f -name '*.img' | head -n1 || true)"
+          fi
+
+          if [ -z "$ROOTFS_IMG" ]; then
+            echo "No rootfs.img found in debian.zip"
+            exit 1
+          fi
+
+          # 【修改这里】使用 $PWD 将其转换为绝对路径再导出
+          echo "ROOTFS_IMG=$PWD/$ROOTFS_IMG" >> "$GITHUB_ENV"
+          ls -lah "$ROOTFS_IMG"
+
+      - name: Install kernel debs into rootfs and extract initrd
         run: |
           set -euxo pipefail
 
           mkdir -p /tmp/rootfs-mnt
-          # 将 sparse image 转换成 raw
+
+          # 将 sparse image 转换成 raw；如果本来就是 raw，则直接复制
           if simg2img "$ROOTFS_IMG" work/root.img 2>/dev/null; then
             echo "Converted sparse rootfs.img to raw root.img"
           else
             cp "$ROOTFS_IMG" work/root.img
+            echo "rootfs.img is already raw, copied to work/root.img"
           fi
 
-          # 扩容逻辑
+          # 如果是单 ext4 文件系统镜像，并且指定了扩容，就先扩容
           if [ "${{ inputs.rootfs_grow_mb }}" != "0" ]; then
-            truncate -s +"${{ inputs.rootfs_grow_mb }}M" work/root.img
-            e2fsck -fy work/root.img || true
-            resize2fs work/root.img
+            if blkid -p work/root.img | grep -q 'TYPE="ext4"'; then
+              truncate -s +"${{ inputs.rootfs_grow_mb }}M" work/root.img
+              e2fsck -fy work/root.img || true
+              resize2fs work/root.img
+            else
+              echo "root.img is not a plain ext4 filesystem image, skip resize"
+            fi
           fi
+
+          LOOPDEV=""
+          ROOTDEV=""
+
+          cleanup() {
+            set +e
+            sync
+            sudo umount /tmp/rootfs-mnt/proc 2>/dev/null || true
+            sudo umount /tmp/rootfs-mnt/dev/pts 2>/dev/null || true
+            sudo umount /tmp/rootfs-mnt/dev 2>/dev/null || true
+            sudo umount /tmp/rootfs-mnt/sys 2>/dev/null || true
+            sudo umount /tmp/rootfs-mnt 2>/dev/null || true
+            if [ -n "${LOOPDEV:-}" ]; then
+              sudo losetup -d "$LOOPDEV" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
 
           LOOPDEV="$(sudo losetup --find --show --partscan work/root.img)"
-          # 自动识别分区或整盘镜像
+          echo "LOOPDEV=$LOOPDEV"
+
           if ls ${LOOPDEV}p* >/dev/null 2>&1; then
             ROOTDEV="$(ls ${LOOPDEV}p* | head -n1)"
           else
             ROOTDEV="$LOOPDEV"
           fi
+          echo "ROOTDEV=$ROOTDEV"
 
           sudo mount "$ROOTDEV" /tmp/rootfs-mnt
 
-          # 准备环境
+          sudo mkdir -p /tmp/rootfs-mnt/root
+          sudo mkdir -p /tmp/rootfs-mnt/usr/bin
+
           sudo cp /usr/bin/qemu-aarch64-static /tmp/rootfs-mnt/usr/bin/
           sudo cp artifacts/deb/*.deb /tmp/rootfs-mnt/root/
           sudo cp /etc/resolv.conf /tmp/rootfs-mnt/etc/resolv.conf || true
@@ -220,82 +306,114 @@ jobs:
           sudo mount --bind /dev/pts /tmp/rootfs-mnt/dev/pts
           sudo mount --bind /sys /tmp/rootfs-mnt/sys
 
-          # 进入 Chroot 执行升级和内核替换
           sudo chroot /tmp/rootfs-mnt /usr/bin/qemu-aarch64-static /bin/bash -eux <<'CHROOT'
           export DEBIAN_FRONTEND=noninteractive
           export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-          # 1. 更换为 Debian 13 (Trixie) 官方源
+          # 1. 更换为官方源 (使用 Debian 13 / Trixie)
           cat > /etc/apt/sources.list <<'EOF'
           deb http://deb.debian.org/debian/ trixie main contrib non-free non-free-firmware
           deb http://deb.debian.org/debian/ trixie-updates main contrib non-free non-free-firmware
           deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
           EOF
 
-          # 2. 准备升级环境
-          # 禁用服务自动启动，防止升级过程中某些服务报错
+          # 2. 准备升级
+          # 防止服务自动启动
           cat > /usr/sbin/policy-rc.d <<'EOF'
           #!/bin/sh
           exit 101
           EOF
           chmod +x /usr/sbin/policy-rc.d
 
-          # 3. 执行系统升级 (从 11 直接跨到 13 可能需要两次，这里强制执行 dist-upgrade)
+          # 执行大规模版本升级
           apt-get update
-          apt-get upgrade -y -o Dpkg::Options::="--force-confold"
           apt-get dist-upgrade -y -o Dpkg::Options::="--force-confold"
-          apt-get autoremove -y
 
-          # 4. 安装必要的底层工具
+          # 3. 安装必要工具（Debian 13 之后建议确保安装 initramfs-tools）
           apt-get install -y --no-install-recommends initramfs-tools busybox kmod udev
 
-          # 5. 清理旧内核及其残余 (OpenStick 默认通常带有 5.15)
+          # 4. 清理旧内核（此时你的 grep 逻辑会清理掉旧的 5.15）
           OLDPKGS="$(dpkg-query -W -f='${Package}\n' 2>/dev/null | grep -E '^linux-(image|headers)-' || true)"
           if [ -n "$OLDPKGS" ]; then
             apt-get purge -y $OLDPKGS || true
           fi
 
-          # 6. 安装新编译的 6.12 内核
-          dpkg -i /root/*.deb
+          # 5. 安装你自己编译的新内核 (.deb 现在是 XZ 压缩，Debian 13 肯定能识别)
+          # 注意：这里如果 dpkg 失败，set -e 会让脚本报错停止，方便排查
+          dpkg -i /root/linux-image-6.12.1-*.deb
+          if ls /root/linux-headers-6.12.1-*.deb >/dev/null 2>&1; then
+            dpkg -i /root/linux-headers-6.12.1-*.deb
+          fi
 
-          # 7. 生成 Initrd
-          # 动态获取安装的内核版本号
-          NEW_KVER="$(basename "$(ls -1dt /lib/modules/6.12* | head -n1)")"
+          # 6. 获取新内核版本号并生成 initrd
+          # 查找刚安装的 7.0.0 目录
+          NEW_KVER="$(basename "$(ls -1dt /lib/modules/6.12.1* | head -n1)")"
+          echo "NEW_KVER=$NEW_KVER"
+
           depmod "$NEW_KVER"
           update-initramfs -c -k "$NEW_KVER"
 
-          # 8. 清理工作
+          # 清理工作
           rm -f /usr/sbin/policy-rc.d
-          rm -rf /root/*.deb
           CHROOT
 
-          # 提取新生成的 initrd 给后续打包 boot.img 使用
-          sudo cp /tmp/rootfs-mnt/boot/initrd.img-* artifacts/kernel/initrd.img
+          INITRD="$(ls -1t /tmp/rootfs-mnt/boot/initrd.img-* | head -n1)"
+          test -f "$INITRD"
 
-          # 卸载
-          sudo sync
-          sudo umount -l /tmp/rootfs-mnt/proc /tmp/rootfs-mnt/dev/pts /tmp/rootfs-mnt/dev /tmp/rootfs-mnt/sys /tmp/rootfs-mnt || true
-          sudo losetup -d "$LOOPDEV" || true
+          sudo cp "$INITRD" artifacts/kernel/initrd.img
 
-          # 转换回 Sparse 格式
-          img2simg work/root.img artifacts/rootfs/rootfs.img || cp work/root.img artifacts/rootfs/rootfs.img
+          # 先清理挂载，再重新打包 rootfs
+          cleanup
+          trap - EXIT
+
+          if img2simg work/root.img artifacts/rootfs/rootfs.img 2>/dev/null; then
+            echo "Converted raw root.img back to sparse rootfs.img"
+          else
+            cp work/root.img artifacts/rootfs/rootfs.img
+            echo "img2simg failed or unavailable, keeping raw rootfs.img"
+          fi
+
+          sudo chown -R "$USER":"$USER" artifacts
 
       - name: Generate boot.img
         run: |
+          set -euxo pipefail
+
+          # 下载 AOSP 官方仓库中的 mkbootimg 脚本
           curl -Lo mkbootimg.py https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/heads/main/mkbootimg.py?format=TEXT | base64 -d > mkbootimg.py
+          chmod +x mkbootimg.py
+
+          test -f artifacts/kernel/kernel-dtb
+          test -f artifacts/kernel/initrd.img
+
+          # 使用下载的脚本进行打包
           python3 mkbootimg.py \
             --base "${{ inputs.boot_base }}" \
             --kernel_offset "${{ inputs.boot_kernel_offset }}" \
             --ramdisk_offset "${{ inputs.boot_ramdisk_offset }}" \
             --tags_offset "${{ inputs.boot_tags_offset }}" \
             --pagesize "${{ inputs.boot_pagesize }}" \
+            --second_offset "${{ inputs.boot_second_offset }}" \
             --ramdisk artifacts/kernel/initrd.img \
             --cmdline "${{ inputs.boot_cmdline }}" \
             --kernel artifacts/kernel/kernel-dtb \
             -o artifacts/kernel/boot.img
 
+          ls -lah artifacts/kernel/boot.img
+
+          ls -lah artifacts/kernel/boot.img
+
+      - name: Generate SHA256
+        run: |
+          set -euxo pipefail
+          (
+            cd artifacts
+            find . -type f -print0 | sort -z | xargs -0 sha256sum
+          ) > artifacts/SHA256SUMS.txt
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: msm8916-mainline-${{ inputs.new_kernel_ref }}
+          name: msm8916-linux-${{ inputs.new_kernel_ref }}-${{ github.run_number }}
           path: artifacts
+          if-no-files-found: error

@@ -429,7 +429,8 @@ jobs:
             LOCALVERSION="$LOCALVERSION" \
             -j"$(nproc)" \
             bindeb-pkg \
-            KDEB_PKGVERSION=1.4
+            KDEB_PKGVERSION=1.4 \
+            DPKG_FLAGS="-d"
       
       - name: Collect Debian package artifacts
         run: |

@@ -83,12 +83,10 @@
 	clocks = <&xo_board>, <&sleep_clk>, <0>, <0>, <0>, <0>, <0>;
 };
 
-&mpss {
-    status = "disabled";
-};
-
-/delete-node/ &mpss_mem;
+/delete-node/ &mba;
+/delete-node/ &mpss;
 /delete-node/ &mba_mem;
+/delete-node/ &mpss_mem;
 
 &pm8916_usbin {
 	status = "okay";

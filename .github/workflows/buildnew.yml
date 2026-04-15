@@ -119,7 +119,7 @@ jobs:
             LATEST_VER="$(curl -fsSL https://www.kernel.org/releases.json \
               | jq -r --arg base "$BASE_VER" '
                   .releases[]
-                  | select(.moniker == "stable")
+                  | select(.moniker == "longterm")
                   | .version
                 ' \
               | grep -E "^${BASE_VER}\.[0-9]+$" \

@@ -1,4 +1,4 @@
-name: build-msm8916-linux-v6.12-kernel-deb
+name: build-msm8916-linux-v6.12-kernel-deb-exram
 
 on:
   workflow_dispatch:

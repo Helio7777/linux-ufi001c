@@ -117,11 +117,7 @@ jobs:
             echo "Query latest stable release for branch ${BASE_VER}.x from kernel.org..."
 
             LATEST_VER="$(curl -fsSL https://www.kernel.org/releases.json \
-              | jq -r --arg base "$BASE_VER" '
-                  .releases[]
-                  | select(.moniker == "longterm")
-                  | .version
-                ' \
+              | jq -r '.releases[].version' \
               | grep -E "^${BASE_VER}\.[0-9]+$" \
               | sort -V \
               | tail -n1 || true)"
@@ -130,17 +126,22 @@ jobs:
 
             if [ -n "${LATEST_VER:-}" ]; then
               LATEST_PL="${LATEST_VER##*.}"
-              if [ "$LATEST_PL" -gt "$CUR_PL" ]; then
-                PATCH_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/patch-${BASE_VER}.${CUR_PL}-${LATEST_VER}.xz"
-                echo "Trying incremental stable patch: $PATCH_URL"
 
-                if curl -fL "$PATCH_URL" -o /tmp/kernel-stable.patch.xz; then
+              if [ "$LATEST_PL" -gt "$CUR_PL" ]; then
+                i="$CUR_PL"
+                while [ "$i" -lt "$LATEST_PL" ]; do
+                  next=$((i + 1))
+                  PATCH_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-${BASE_VER}.${i}-${next}.xz"
+                  echo "Applying incremental stable patch: $PATCH_URL"
+
+                  curl -fL "$PATCH_URL" -o /tmp/kernel-stable.patch.xz
                   xz -dc /tmp/kernel-stable.patch.xz | patch -p1
+
+                  i="$next"
                   APPLIED=1
-                  echo "Applied stable patch: ${BASE_VER}.${CUR_PL} -> ${LATEST_VER}"
-                else
-                  echo "No incremental patch found at $PATCH_URL, skip auto stable patch"
-                fi
+                done
+
+                echo "Applied stable patch series: ${BASE_VER}.${CUR_PL} -> ${BASE_VER}.${LATEST_PL}"
               else
                 echo "Current patchlevel already latest or newer, skip stable patch"
               fi
@@ -169,6 +170,7 @@ jobs:
           else
             echo "No patch applied"
           fi
+
 
       - name: Generate v6.12 config
         run: |

@@ -62,7 +62,7 @@ jobs:
     env:
       ARCH: arm64
       CROSS_COMPILE: aarch64-linux-gnu-
-      LOCALVERSION: -msm8916-mainline
+      LOCALVERSION: -exram
 
     steps:
       - name: Checkout current repo

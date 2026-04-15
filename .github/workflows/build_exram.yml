@@ -108,7 +108,7 @@ jobs:
           set -euxo pipefail
           DTS_DIR="linux/arch/arm64/boot/dts/qcom"
           mkdir -p "$DTS_DIR"
-          find "$GITHUB_WORKSPACE" -maxdepth 1 -type f \( -name "*.dts" -o -name "*.dtsi" \) \
+          find "$GITHUB_WORKSPACE" -maxdepth 2 -type f \( -name "*.dts" -o -name "*.dtsi" \) \
             -exec cp -v {} "$DTS_DIR"/ \;
           ls linux/arch/arm64/boot/dts/qcom | grep "msm8916"
           cat linux/arch/arm64/boot/dts/qcom/msm8916-ufi.dtsi

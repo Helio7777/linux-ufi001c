@@ -1,0 +1,124 @@
+name: Compare msm8916 vs upstream 6.12 + 6.12.1 patch
+
+on:
+  workflow_dispatch:
+    inputs:
+      msm_repo:
+        description: "MSM repo URL"
+        required: true
+        default: "https://github.com/msm8916-mainline/linux.git"
+      msm_ref:
+        description: "MSM branch/tag"
+        required: true
+        default: "v6.12.1-msm8916"
+      upstream_repo:
+        description: "Upstream repo URL"
+        required: true
+        default: "https://github.com/torvalds/linux.git"
+      upstream_base_ref:
+        description: "Upstream base tag"
+        required: true
+        default: "v6.12"
+      patch_version:
+        description: "Patch version to apply"
+        required: true
+        default: "6.12.1"
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xz-utils patch rsync
+
+      - name: Clone upstream linux
+        run: |
+          git clone --depth=1 --branch "${{ inputs.upstream_base_ref }}" "${{ inputs.upstream_repo }}" upstream-linux
+
+      - name: Apply upstream patch
+        run: |
+          cd upstream-linux
+          PATCH_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/patch-${{ inputs.patch_version }}.xz"
+          echo "Downloading patch: ${PATCH_URL}"
+          curl -L "${PATCH_URL}" -o patch.xz
+          xz -dc patch.xz > patch.diff
+          patch -p1 < patch.diff
+
+      - name: Clone msm linux
+        run: |
+          git clone --depth=1 --branch "${{ inputs.msm_ref }}" "${{ inputs.msm_repo }}" msm-linux
+
+      - name: Export clean source trees
+        run: |
+          mkdir -p exported/upstream exported/msm
+
+          git -C upstream-linux archive HEAD | tar -x -C exported/upstream
+          git -C msm-linux archive HEAD | tar -x -C exported/msm
+
+      - name: Generate diff outputs
+        run: |
+          mkdir -p output
+
+          set +e
+
+          git diff --no-index \
+            --src-prefix=upstream/ \
+            --dst-prefix=msm/ \
+            exported/upstream exported/msm \
+            > output/upstream-6.12.1-vs-msm8916.diff
+          DIFF_EXIT=$?
+
+          git diff --no-index --stat \
+            exported/upstream exported/msm \
+            > output/diffstat.txt
+          STAT_EXIT=$?
+
+          diff -ruN exported/upstream exported/msm \
+            > output/unified.diff
+          UNIFIED_EXIT=$?
+
+          diff -qr exported/upstream exported/msm \
+            > output/changed-files.txt
+          CHANGED_EXIT=$?
+
+          echo "git diff exit code: $DIFF_EXIT"
+          echo "git diff --stat exit code: $STAT_EXIT"
+          echo "diff -ruN exit code: $UNIFIED_EXIT"
+          echo "diff -qr exit code: $CHANGED_EXIT"
+
+          # 差异存在时退出码通常为 1，这不是错误
+          if [ "$DIFF_EXIT" -gt 1 ] || [ "$STAT_EXIT" -gt 1 ] || [ "$UNIFIED_EXIT" -gt 1 ] || [ "$CHANGED_EXIT" -gt 1 ]; then
+            echo "Unexpected diff command failure"
+            exit 1
+          fi
+
+      - name: Create summary
+        run: |
+          echo "# Linux source comparison result" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- MSM repo: \`${{ inputs.msm_repo }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- MSM ref: \`${{ inputs.msm_ref }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Upstream repo: \`${{ inputs.upstream_repo }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Upstream base ref: \`${{ inputs.upstream_base_ref }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Applied patch version: \`${{ inputs.patch_version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          CHANGED_COUNT=$(wc -l < output/changed-files.txt || echo 0)
+          echo "- Changed file entries: ${CHANGED_COUNT}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## diffstat" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          head -n 200 output/diffstat.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-compare-results
+          path: output/

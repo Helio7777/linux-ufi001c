@@ -110,6 +110,8 @@ jobs:
           mkdir -p "$DTS_DIR"
           find "$GITHUB_WORKSPACE" -maxdepth 1 -type f \( -name "*.dts" -o -name "*.dtsi" \) \
             -exec cp -v {} "$DTS_DIR"/ \;
+          ls linux/arch/arm64/boot/dts/qcom | grep "msm8916"
+          cat linux/arch/arm64/boot/dts/qcom/msm8916-ufi.dtsi
 
       - name: Generate v6.12 config
         run: |

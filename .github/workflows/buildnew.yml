@@ -1,0 +1,270 @@
+name: build-msm8916-linux-v6.12-kernel-deb
+
+on:
+  workflow_dispatch:
+    inputs:
+      old_kernel_repo:
+        description: "原 5.15 内核仓库地址"
+        required: true
+        default: "https://github.com/OpenStick/linux.git"
+
+      old_kernel_ref:
+        description: "原 5.15 分支或 tag"
+        required: true
+        default: "master"
+
+      old_defconfig:
+        description: "原项目 defconfig 名称"
+        required: true
+        default: "msm8916_defconfig"
+
+      new_kernel_repo:
+        description: "主线内核仓库"
+        required: true
+        default: "https://github.com/msm8916-mainline/linux.git"
+
+      new_kernel_ref:
+        description: "主线内核分支或 tag"
+        required: true
+        default: "v6.12.1-msm8916"
+
+      device_dtb:
+        description: "目标 DTB 相对路径"
+        required: true
+        default: "arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb"
+
+      kernel_base_version:
+        description: "内核主版本，用于自动获取 stable patch，例如 6.12"
+        required: true
+        default: "6.12"
+
+      kernel_current_patchlevel:
+        description: "当前内核 patchlevel，例如 1 表示 v6.12.1"
+        required: true
+        default: "1"
+
+      apply_latest_stable_patch:
+        description: "是否自动应用 kernel.org 最新 stable patch"
+        required: true
+        default: "true"
+
+      extra_patch_urls:
+        description: "额外补丁 URL，多个用空格分隔，可留空"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      LOCALVERSION: -msm8916-mainline
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl wget unzip rsync bc bison flex build-essential \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libssl-dev libelf-dev libdw-dev libncurses-dev pahole \
+            cpio fakeroot dpkg-dev debhelper devscripts equivs kmod \
+            xz-utils zstd python3 dwarves crossbuild-essential-arm64 \
+            jq
+
+      - name: Prepare directories
+        run: mkdir -p artifacts/kernel artifacts/deb artifacts/config work
+
+      - name: Clone old 5.15 kernel tree
+        run: |
+          set -euxo pipefail
+          git clone --depth=1 --branch "${{ inputs.old_kernel_ref }}" \
+            "${{ inputs.old_kernel_repo }}" linux-old
+
+      - name: Expand old 5.15 defconfig
+        run: |
+          set -euxo pipefail
+          mkdir -p build-old
+          make -C linux-old O="$PWD/build-old" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+            ${{ inputs.old_defconfig }} olddefconfig
+          cp build-old/.config work/old-5.15.full.config
+
+      - name: Clone msm8916-mainline linux
+        run: |
+          set -euxo pipefail
+          git clone --depth=1 --branch "${{ inputs.new_kernel_ref }}" \
+            "${{ inputs.new_kernel_repo }}" linux
+
+      - name: Apply latest stable patch
+        if: ${{ inputs.apply_latest_stable_patch == 'true' || inputs.extra_patch_urls != '' }}
+        run: |
+          set -euxo pipefail
+          cd linux
+
+          BASE_VER="${{ inputs.kernel_base_version }}"
+          CUR_PL="${{ inputs.kernel_current_patchlevel }}"
+          APPLIED=0
+
+          if [ "${{ inputs.apply_latest_stable_patch }}" = "true" ]; then
+            echo "Query latest stable release for branch ${BASE_VER}.x from kernel.org..."
+
+            LATEST_VER="$(curl -fsSL https://www.kernel.org/releases.json \
+              | jq -r --arg base "$BASE_VER" '
+                  .releases[]
+                  | select(.moniker == "stable")
+                  | .version
+                ' \
+              | grep -E "^${BASE_VER}\.[0-9]+$" \
+              | sort -V \
+              | tail -n1 || true)"
+
+            echo "Detected latest stable version: ${LATEST_VER:-<none>}"
+
+            if [ -n "${LATEST_VER:-}" ]; then
+              LATEST_PL="${LATEST_VER##*.}"
+              if [ "$LATEST_PL" -gt "$CUR_PL" ]; then
+                PATCH_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/patch-${BASE_VER}.${CUR_PL}-${LATEST_VER}.xz"
+                echo "Trying incremental stable patch: $PATCH_URL"
+
+                if curl -fL "$PATCH_URL" -o /tmp/kernel-stable.patch.xz; then
+                  xz -dc /tmp/kernel-stable.patch.xz | patch -p1
+                  APPLIED=1
+                  echo "Applied stable patch: ${BASE_VER}.${CUR_PL} -> ${LATEST_VER}"
+                else
+                  echo "No incremental patch found at $PATCH_URL, skip auto stable patch"
+                fi
+              else
+                echo "Current patchlevel already latest or newer, skip stable patch"
+              fi
+            else
+              echo "Could not detect latest stable version, skip auto stable patch"
+            fi
+          fi
+
+          if [ -n "${{ inputs.extra_patch_urls }}" ]; then
+            for url in ${{ inputs.extra_patch_urls }}; do
+              echo "Applying extra patch: $url"
+              fname="/tmp/$(basename "$url")"
+              curl -fL "$url" -o "$fname"
+              case "$fname" in
+                *.xz) xz -dc "$fname" | patch -p1 ;;
+                *.gz) gzip -dc "$fname" | patch -p1 ;;
+                *.bz2) bzip2 -dc "$fname" | patch -p1 ;;
+                *) patch -p1 < "$fname" ;;
+              esac
+              APPLIED=1
+            done
+          fi
+
+          if [ "$APPLIED" = "1" ]; then
+            echo "Patch(es) applied successfully"
+          else
+            echo "No patch applied"
+          fi
+
+      - name: Generate v6.12 config
+        run: |
+          set -euxo pipefail
+          mkdir -p build
+
+          make -C linux O="$PWD/build" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+            msm8916_defconfig
+
+          cp "$PWD/work/old-5.15.full.config" "$PWD/build/.config"
+
+          make -C linux O="$PWD/build" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+            LOCALVERSION="$LOCALVERSION" olddefconfig
+
+          cp build/.config artifacts/config/linux-6.12.msm8916.config
+
+      - name: Audit critical config
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def parse(path):
+              cfg = {}
+              for line in Path(path).read_text().splitlines():
+                  if line.startswith("CONFIG_") and "=" in line:
+                      k, v = line.split("=", 1)
+                      cfg[k] = v
+              return cfg
+
+          new = parse("build/.config")
+          critical = [
+              "CONFIG_ARCH_QCOM",
+              "CONFIG_SERIAL_MSM",
+              "CONFIG_MMC_SDHCI_MSM",
+              "CONFIG_EXT4_FS"
+          ]
+          bad = [k for k in critical if new.get(k) != "y"]
+          if bad:
+              print(f"Critical config missing: {bad}")
+              exit(1)
+          PY
+
+      - name: Build kernel and modules
+        run: |
+          set -euxo pipefail
+          make -C linux O="$PWD/build" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+            LOCALVERSION="$LOCALVERSION" -j"$(nproc)" Image.gz dtbs modules
+
+          cat build/arch/arm64/boot/Image.gz "build/${{ inputs.device_dtb }}" > artifacts/kernel/kernel-dtb
+          cp build/vmlinux artifacts/kernel/
+
+      - name: Build Debian packages with bindeb-pkg
+        run: |
+          set -euxo pipefail
+          test -f build/.config
+
+          fakeroot make -C linux \
+            O="$PWD/build" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            LOCALVERSION="$LOCALVERSION" \
+            -j"$(nproc)" \
+            bindeb-pkg \
+            KDEB_PKGVERSION=1.4 \
+            KDEB_COMPRESS=xz \
+            DPKG_FLAGS="-d"
+
+      - name: Collect Debian package artifacts
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts/deb
+          find . -maxdepth 1 -type f -name "*.deb" -exec cp -v {} artifacts/deb/ \;
+          find . -maxdepth 1 -type f -name "*.changes" -exec cp -v {} artifacts/deb/ \; || true
+          find . -maxdepth 1 -type f -name "*.buildinfo" -exec cp -v {} artifacts/deb/ \; || true
+          ls -lah artifacts/deb
+
+      - name: Generate SHA256
+        if: always()
+        run: |
+          set -euxo pipefail
+          (
+            cd artifacts
+            find . -type f -print0 | sort -z | xargs -0 sha256sum
+          ) > artifacts/SHA256SUMS.txt
+
+      - name: Upload final artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msm8916-linux-${{ inputs.new_kernel_ref }}-${{ github.run_number }}
+          path: |
+            artifacts/kernel/kernel-dtb
+            artifacts/kernel/vmlinux
+            artifacts/deb
+            artifacts/config
+            artifacts/SHA256SUMS.txt
+          if-no-files-found: error
+

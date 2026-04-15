@@ -83,7 +83,6 @@
 	clocks = <&xo_board>, <&sleep_clk>, <0>, <0>, <0>, <0>, <0>;
 };
 
-/delete-node/ &mba;
 /delete-node/ &mpss;
 /delete-node/ &mba_mem;
 /delete-node/ &mpss_mem;

@@ -81,16 +81,16 @@
 };
 
 &mba_mem {
-	status = "okay";
+	status = "disabled";
 };
 
 &mpss {
-	status = "okay";
+	status = "disabled";
 };
 
 &mpss_mem {
 	reg = <0x0 0x86800000 0x0 0x0>;
-	status = "okay";
+	status = "disabled";
 };
 
 &pm8916_usbin {

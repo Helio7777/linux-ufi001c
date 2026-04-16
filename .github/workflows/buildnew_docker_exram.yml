@@ -1,0 +1,178 @@
+name: build-msm8916-linux-v6.12-kernel-deb-exram
+
+on:
+  workflow_dispatch:
+    inputs:
+      new_kernel_repo:
+        description: "主线内核仓库"
+        required: true
+        default: "https://github.com/msm8916-mainline/linux.git"
+
+      new_kernel_ref:
+        description: "主线内核分支或 tag"
+        required: true
+        default: "v6.12.1-msm8916"
+
+      device_dtb:
+        description: "目标 DTB 相对路径"
+        required: true
+        default: "arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb"
+
+      kernel_base_version:
+        description: "内核主版本，用于自动获取 stable patch，例如 6.12"
+        required: true
+        default: "6.12"
+
+      kernel_current_patchlevel:
+        description: "当前内核 patchlevel，例如 1 表示 v6.12.1"
+        required: true
+        default: "1"
+
+      apply_latest_stable_patch:
+        description: "是否自动应用 kernel.org 最新 stable patch"
+        required: true
+        default: "true"
+
+      extra_patch_urls:
+        description: "额外补丁 URL，多个用空格分隔，可留空"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      LOCALVERSION: -exram
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl wget unzip rsync bc bison flex build-essential \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libssl-dev libelf-dev libdw-dev libncurses-dev pahole \
+            cpio fakeroot dpkg-dev debhelper devscripts equivs kmod \
+            xz-utils zstd python3 dwarves crossbuild-essential-arm64 \
+            jq
+
+      - name: Prepare directories
+        run: mkdir -p artifacts/kernel artifacts/deb artifacts/config build
+
+      - name: Clone msm8916-mainline linux
+        run: |
+          set -euxo pipefail
+          git clone --depth=1 --branch "${{ inputs.new_kernel_ref }}" \
+            "${{ inputs.new_kernel_repo }}" linux
+
+      - name: Copy DTS from checked out repo
+        run: |
+          set -euxo pipefail
+          DTS_DIR="linux/arch/arm64/boot/dts/qcom"
+          mkdir -p "$DTS_DIR"
+          find "$GITHUB_WORKSPACE" -maxdepth 2 -type f \( -name "*.dts" -o -name "*.dtsi" \) \
+            -exec cp -v {} "$DTS_DIR"/ \;
+          ls linux/arch/arm64/boot/dts/qcom | grep "msm8916" || true
+
+      - name: Use repo config as kernel config
+        run: |
+          set -euxo pipefail
+          test -f "$GITHUB_WORKSPACE/config/linux-6.12.msm8916.config"
+          cp "$GITHUB_WORKSPACE/config/linux-6.12.msm8916.config" build/.config
+
+          make -C linux O="$PWD/build" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+            LOCALVERSION="$LOCALVERSION" olddefconfig
+
+          cp build/.config artifacts/config/linux-6.12.msm8916.config
+
+      - name: Audit critical config
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def parse(path):
+              cfg = {}
+              for line in Path(path).read_text().splitlines():
+                  if line.startswith("CONFIG_") and "=" in line:
+                      k, v = line.split("=", 1)
+                      cfg[k] = v
+              return cfg
+
+          new = parse("build/.config")
+          critical = [
+              "CONFIG_ARCH_QCOM",
+              "CONFIG_SERIAL_MSM",
+              "CONFIG_MMC_SDHCI_MSM",
+              "CONFIG_EXT4_FS"
+          ]
+          bad = [k for k in critical if new.get(k) != "y"]
+          if bad:
+              print(f"Critical config missing: {bad}")
+              exit(1)
+          PY
+
+      - name: Build kernel and modules
+        run: |
+          set -euxo pipefail
+          make -C linux O="$PWD/build" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+            LOCALVERSION="$LOCALVERSION" -j"$(nproc)" Image.gz dtbs modules
+
+          cat build/arch/arm64/boot/Image.gz "build/${{ inputs.device_dtb }}" > artifacts/kernel/kernel-dtb
+          cp build/vmlinux artifacts/kernel/
+
+      - name: Build Debian packages with bindeb-pkg
+        run: |
+          set -euxo pipefail
+          test -f build/.config
+
+          fakeroot make -C linux \
+            O="$PWD/build" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            LOCALVERSION="$LOCALVERSION" \
+            -j"$(nproc)" \
+            bindeb-pkg \
+            KDEB_PKGVERSION=1.4 \
+            KDEB_COMPRESS=xz \
+            DPKG_FLAGS="-d"
+
+      - name: Collect Debian package artifacts
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts/deb
+          find . -maxdepth 1 -type f -name "*.deb" -exec cp -v {} artifacts/deb/ \;
+          find . -maxdepth 1 -type f -name "*.changes" -exec cp -v {} artifacts/deb/ \; || true
+          find . -maxdepth 1 -type f -name "*.buildinfo" -exec cp -v {} artifacts/deb/ \; || true
+          ls -lah artifacts/deb
+
+      - name: Generate SHA256
+        if: always()
+        run: |
+          set -euxo pipefail
+          (
+            cd artifacts
+            find . -type f -print0 | sort -z | xargs -0 sha256sum
+          ) > artifacts/SHA256SUMS.txt
+
+      - name: Upload final artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msm8916-linux-${{ inputs.new_kernel_ref }}-${{ github.run_number }}
+          path: |
+            artifacts/kernel/kernel-dtb
+            artifacts/kernel/vmlinux
+            artifacts/deb
+            artifacts/config
+            artifacts/SHA256SUMS.txt
+          if-no-files-found: error

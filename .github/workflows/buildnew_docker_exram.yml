@@ -87,7 +87,7 @@ jobs:
         run: |
           set -euxo pipefail
           test -f "$GITHUB_WORKSPACE/config/linux-6.12.msm8916.config"
-          cp "$GITHUB_WORKSPACE/config/linux-6.12.msm8916.config" build/.config
+          cp "$GITHUB_WORKSPACE/config/new.config" build/.config
 
           make -C linux O="$PWD/build" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
             LOCALVERSION="$LOCALVERSION" olddefconfig

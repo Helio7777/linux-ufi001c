@@ -1,4 +1,5 @@
 name: build-msm8916-linux-v6.12-patch
+run-name: build-msm8916-linux-v6.12-patch by @${{ github.actor }}
 on:
   workflow_dispatch:
     inputs:
@@ -30,12 +31,11 @@ on:
         description: "额外补丁 URL，多个用空格分隔，可留空"
         required: false
         default: ""
-
 permissions:
   contents: read
-
 jobs:
   build:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     name: Build msm8916 kernel
     runs-on: ubuntu-24.04
 

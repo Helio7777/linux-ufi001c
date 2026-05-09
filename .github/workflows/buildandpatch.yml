@@ -133,10 +133,12 @@ jobs:
             local orig="${file}.orig"
 
             echo "Checking whether conflict can be auto-resolved for ${file}"
+
             if [ ! -f "$rej" ]; then
               echo "Known reject file not found: $rej"
               return 1
             fi
+
             echo "Found known reject file: $rej"
             echo "Reject content:"
             cat "$rej" | tee "$log_dir/ktd2692.reject.txt"
@@ -146,31 +148,18 @@ jobs:
               return 1
             fi
 
-            # 将 Python 修正脚本写入临时文件，并保证脚本内容没有多余缩进
-            # 这里刻意把 cat 和结束标记都退回到与 run: 块相同的基准缩进（本行即如此）
-            cat > /tmp/fix_ktd2692.py <<'PYEOF'
-from pathlib import Path
-p = Path("drivers/leds/flash/leds-ktd2692.c")
-if not p.exists():
-    raise SystemExit("drivers/leds/flash/leds-ktd2692.c does not exist")
-s = p.read_text()
-insert = "\tled->props.timing = ktd2692_timing;\n"
-needle = "\tled_cdev = &fled_cdev->led_cdev;\n"
-if "led->props.timing = ktd2692_timing;" in s:
-    print("Already contains led->props.timing = ktd2692_timing;")
-else:
-    if needle not in s:
-        raise SystemExit("Cannot find insertion point: led_cdev = &fled_cdev->led_cdev;")
-    s = s.replace(needle, needle + insert, 1)
-    p.write_text(s)
-    print("Inserted led->props.timing = ktd2692_timing;")
-PYEOF
-
-            python3 /tmp/fix_ktd2692.py
-            rm /tmp/fix_ktd2692.py
+            # sed 插入：在 "led_cdev = &fled_cdev->led_cdev;" 后添加新行
+            # 如果文件已存在该行则跳过
+            if ! grep -qF "led->props.timing = ktd2692_timing;" "$file"; then
+              sed -i '/\tled_cdev = &fled_cdev->led_cdev;/a \tled->props.timing = ktd2692_timing;' "$file"
+              echo "Inserted led->props.timing = ktd2692_timing;"
+            else
+              echo "Already contains led->props.timing = ktd2692_timing;"
+            fi
 
             rm -f "$rej"
             rm -f "$orig"
+
             echo "Auto-resolved known ktd2692 conflict for ${patch_name}"
 
             {
@@ -179,6 +168,7 @@ PYEOF
               echo "Inserted line:"
               echo "led->props.timing = ktd2692_timing;"
             } > "$log_dir/ktd2692-auto-resolved.txt"
+
             return 0
           }
 

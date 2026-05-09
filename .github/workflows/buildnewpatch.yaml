@@ -19,7 +19,7 @@ on:
         default: "arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb"
 
       kernel_base_version:
-        description: "内核主版本，用于自动获取 stable patch，例如 6.12"
+        description: "内核主版本，例如 6.12"
         required: true
         default: "6.12"
 
@@ -29,7 +29,7 @@ on:
         default: "1"
 
       apply_latest_stable_patch:
-        description: "是否自动应用 kernel.org 最新 stable patch"
+        description: "是否自动应用 kernel.org 最新 stable patch，best-effort 跳过冲突文件"
         required: true
         default: "true"
 
@@ -57,7 +57,9 @@ jobs:
       - name: Install dependencies
         run: |
           set -euxo pipefail
+
           sudo apt-get update
+
           sudo apt-get install -y \
             git curl wget unzip rsync bc bison flex build-essential \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
@@ -69,12 +71,14 @@ jobs:
       - name: Prepare directories
         run: |
           set -euxo pipefail
-          mkdir -p artifacts/kernel artifacts/deb artifacts/config build
+
+          mkdir -p artifacts/kernel artifacts/deb artifacts/config artifacts/patch-log build
 
       - name: Prepare artifact name
         id: artifact_name
         run: |
           set -euxo pipefail
+
           SAFE_REF="$(echo '${{ inputs.new_kernel_ref }}' | tr '/:@ ' '----')"
           echo "name=msm8916-linux-${SAFE_REF}-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
@@ -88,18 +92,21 @@ jobs:
           git -C linux status
           git -C linux log --oneline -n 5
 
-      - name: Apply latest kernel.org stable incremental patches
+          echo "Kernel Makefile version before patch:"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) = ' linux/Makefile || true
+          make -C linux kernelversion || true
+
+      - name: Apply kernel.org stable incremental patches best-effort
         if: ${{ inputs.apply_latest_stable_patch == 'true' }}
         run: |
           set -euxo pipefail
 
           BASE="${{ inputs.kernel_base_version }}"
           CURRENT="${{ inputs.kernel_current_patchlevel }}"
+          MAJOR="${BASE%%.*}"
 
           echo "Base kernel version: ${BASE}"
           echo "Current patchlevel: ${CURRENT}"
-
-          MAJOR="${BASE%%.*}"
 
           LATEST_VERSION="$(
             curl -fsSL https://www.kernel.org/releases.json |
@@ -117,40 +124,273 @@ jobs:
             exit 1
           fi
 
+          TARGET="${LATEST_VERSION##*.}"
+
           echo "Latest stable version detected: ${LATEST_VERSION}"
+          echo "Target patchlevel: ${TARGET}"
 
-          LATEST_PATCHLEVEL="${LATEST_VERSION##*.}"
-
-          echo "Latest patchlevel: ${LATEST_PATCHLEVEL}"
-
-          if [ "$LATEST_PATCHLEVEL" -le "$CURRENT" ]; then
-            echo "Current kernel is already up to date: ${BASE}.${CURRENT}"
+          if [ "$TARGET" -le "$CURRENT" ]; then
+            echo "Current kernel is already >= target: ${BASE}.${CURRENT} >= ${BASE}.${TARGET}"
             exit 0
           fi
 
           cd linux
 
-          for NEXT in $(seq $((CURRENT + 1)) "$LATEST_PATCHLEVEL"); do
+          echo "Kernel version before patch:"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) = ' Makefile || true
+          make kernelversion || true
+
+          for NEXT in $(seq $((CURRENT + 1)) "$TARGET"); do
             PREV=$((NEXT - 1))
+
             PATCH_URL="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/incr/patch-${BASE}.${PREV}-${NEXT}.xz"
-            PATCH_FILE="/tmp/patch-${BASE}.${PREV}-${NEXT}.xz"
+            PATCH_XZ="/tmp/patch-${BASE}.${PREV}-${NEXT}.xz"
+            PATCH_TXT="/tmp/patch-${BASE}.${PREV}-${NEXT}.patch"
+            FILTERED_PATCH="/tmp/patch-${BASE}.${PREV}-${NEXT}.filtered.patch"
+
+            LOG_DIR="../artifacts/patch-log/patch-${BASE}.${PREV}-${NEXT}"
+            mkdir -p "$LOG_DIR"
+
+            DRY_LOG="$LOG_DIR/dry-run.log"
+            APPLY_LOG="$LOG_DIR/apply.log"
+            FILTER_LOG="$LOG_DIR/filter.log"
+            CONFLICT_FILES="$LOG_DIR/conflict-files.txt"
 
             echo "============================================================"
-            echo "Applying stable incremental patch:"
+            echo "Applying stable incremental patch best-effort:"
             echo "${PATCH_URL}"
             echo "============================================================"
 
-            curl -fL "$PATCH_URL" -o "$PATCH_FILE"
+            curl -fL "$PATCH_URL" -o "$PATCH_XZ"
+            xzcat "$PATCH_XZ" > "$PATCH_TXT"
 
-            xzcat "$PATCH_FILE" | patch -p1 --forward --batch
+            echo "Dry-run full patch ${BASE}.${PREV} -> ${BASE}.${NEXT}"
 
-            echo "Applied stable patch ${BASE}.${PREV} -> ${BASE}.${NEXT}"
+            set +e
+            patch -p1 --forward --batch --dry-run < "$PATCH_TXT" > "$DRY_LOG" 2>&1
+            DRY_RC=$?
+            set -e
+
+            if [ "$DRY_RC" -eq 0 ]; then
+              echo "Full patch dry-run passed. Applying full patch."
+
+              set +e
+              patch -p1 --forward --batch < "$PATCH_TXT" > "$APPLY_LOG" 2>&1
+              APPLY_RC=$?
+              set -e
+
+              echo "full patch exit code: $APPLY_RC"
+
+              if [ "$APPLY_RC" -ne 0 ]; then
+                echo "Full patch apply returned non-zero, but continue best-effort."
+                tail -n 200 "$APPLY_LOG" || true
+              fi
+
+            else
+              echo "Full patch dry-run failed. Trying to skip conflicted files."
+
+              echo "---- dry-run log tail ----"
+              tail -n 200 "$DRY_LOG" || true
+              echo "--------------------------"
+
+              python3 - "$DRY_LOG" "$CONFLICT_FILES" <<'PY'
+          import sys
+          from pathlib import Path
+
+          dry_log = Path(sys.argv[1])
+          out = Path(sys.argv[2])
+
+          current = None
+          bad = set()
+
+          for line in dry_log.read_text(errors="ignore").splitlines():
+              line = line.rstrip("\n")
+
+              for prefix in ("checking file ", "patching file "):
+                  if line.startswith(prefix):
+                      current = line[len(prefix):].strip()
+                      break
+
+              lower = line.lower()
+
+              failed_markers = [
+                  "failed",
+                  "malformed patch",
+                  "can't find file to patch",
+                  "no file to patch",
+                  "does not exist",
+                  "is not a regular file",
+                  "reversed or previously applied",
+                  "previously applied",
+                  "already applied",
+                  "skipping patch",
+                  "hunk",
+              ]
+
+              if current and any(marker in lower for marker in failed_markers):
+                  if "succeeded" not in lower:
+                      bad.add(current)
+
+          out.write_text("\n".join(sorted(bad)) + ("\n" if bad else ""))
+          PY
+
+              echo "Conflict files detected:"
+              cat "$CONFLICT_FILES" || true
+
+              if [ ! -s "$CONFLICT_FILES" ]; then
+                echo "No conflict files parsed from dry-run log."
+                echo "Fallback: apply original patch best-effort and continue."
+
+                set +e
+                patch -p1 --forward --batch < "$PATCH_TXT" > "$APPLY_LOG" 2>&1
+                APPLY_RC=$?
+                set -e
+
+                echo "patch exit code: $APPLY_RC"
+                tail -n 200 "$APPLY_LOG" || true
+
+              else
+                echo "Filtering patch and removing conflicted file diffs..."
+
+                python3 - "$PATCH_TXT" "$CONFLICT_FILES" "$FILTERED_PATCH" "$FILTER_LOG" <<'PY'
+          import sys
+          import re
+          from pathlib import Path
+
+          patch_file = Path(sys.argv[1])
+          conflict_file = Path(sys.argv[2])
+          out_file = Path(sys.argv[3])
+          log_file = Path(sys.argv[4])
+
+          conflicts = set(
+              line.strip()
+              for line in conflict_file.read_text(errors="ignore").splitlines()
+              if line.strip()
+          )
+
+          lines = patch_file.read_text(errors="ignore").splitlines(keepends=True)
+
+          blocks = []
+          current = []
+
+          for line in lines:
+              if line.startswith("diff --git "):
+                  if current:
+                      blocks.append(current)
+                  current = [line]
+              else:
+                  if current:
+                      current.append(line)
+                  else:
+                      current = [line]
+
+          if current:
+              blocks.append(current)
+
+          kept = []
+          skipped = []
+
+          diff_re = re.compile(r"^diff --git a/(.*?) b/(.*?)\s*$")
+
+          for block in blocks:
+              first = block[0].rstrip("\n")
+              m = diff_re.match(first)
+
+              if not m:
+                  kept.extend(block)
+                  continue
+
+              a_path, b_path = m.group(1), m.group(2)
+
+              if a_path in conflicts or b_path in conflicts:
+                  skipped.append(a_path)
+                  continue
+
+              kept.extend(block)
+
+          out_file.write_text("".join(kept))
+
+          log_file.write_text(
+              "Conflicted files:\n"
+              + "\n".join(sorted(conflicts))
+              + "\n\nSkipped diff blocks:\n"
+              + "\n".join(sorted(set(skipped)))
+              + "\n"
+          )
+          PY
+
+                echo "Filtered patch info:"
+                cat "$FILTER_LOG" || true
+
+                echo "Dry-run filtered patch..."
+
+                set +e
+                patch -p1 --forward --batch --dry-run < "$FILTERED_PATCH" > "$LOG_DIR/filtered-dry-run.log" 2>&1
+                FILTER_DRY_RC=$?
+                set -e
+
+                if [ "$FILTER_DRY_RC" -eq 0 ]; then
+                  echo "Filtered patch dry-run passed. Applying filtered patch."
+
+                  set +e
+                  patch -p1 --forward --batch < "$FILTERED_PATCH" > "$APPLY_LOG" 2>&1
+                  APPLY_RC=$?
+                  set -e
+
+                  echo "filtered patch exit code: $APPLY_RC"
+
+                  if [ "$APPLY_RC" -ne 0 ]; then
+                    tail -n 200 "$APPLY_LOG" || true
+                  fi
+
+                else
+                  echo "Filtered patch still failed."
+                  echo "Fallback: apply original patch best-effort and continue."
+
+                  tail -n 200 "$LOG_DIR/filtered-dry-run.log" || true
+
+                  set +e
+                  patch -p1 --forward --batch < "$PATCH_TXT" > "$APPLY_LOG" 2>&1
+                  APPLY_RC=$?
+                  set -e
+
+                  echo "fallback patch exit code: $APPLY_RC"
+                  tail -n 200 "$APPLY_LOG" || true
+                fi
+              fi
+            fi
+
+            echo "Collecting .rej and .orig files after ${BASE}.${PREV} -> ${BASE}.${NEXT}"
+
+            find . \( -name "*.rej" -o -name "*.orig" \) -type f | sort > "$LOG_DIR/reject-orig-files.txt" || true
+
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              mkdir -p "$LOG_DIR/files/$(dirname "$f")"
+              cp -v "$f" "$LOG_DIR/files/$f" || true
+            done < "$LOG_DIR/reject-orig-files.txt"
+
+            echo "Applied best-effort stable patch ${BASE}.${PREV} -> ${BASE}.${NEXT}"
+
+            echo "Kernel Makefile version after patch ${BASE}.${NEXT}:"
+            grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) = ' Makefile || true
+            make kernelversion || true
+
+            echo "Git status short after ${BASE}.${NEXT}:"
+            git status --short || true
           done
 
-          echo "Final kernel version after stable patching:"
-          make kernelversion
+          echo "============================================================"
+          echo "Finished best-effort stable patching."
+          echo "============================================================"
 
-          echo "Git status after stable patches:"
+          echo "Final kernel version:"
+          make kernelversion || true
+
+          echo "Final Makefile version fields:"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) = ' Makefile || true
+
+          echo "Final git status:"
           git status --short || true
 
       - name: Apply extra patch URLs
@@ -169,6 +409,7 @@ jobs:
 
             RAW_PATCH="/tmp/extra-${i}.download"
             PATCH="/tmp/extra-${i}.patch"
+            PATCH_LOG="../artifacts/patch-log/extra-${i}.log"
 
             echo "============================================================"
             echo "Downloading extra patch:"
@@ -196,15 +437,27 @@ jobs:
 
             if grep -q "^From [0-9a-fA-F]\{40\} " "$PATCH" || grep -q "^Subject: " "$PATCH"; then
               echo "Applying as git mailbox patch with git am"
-              git am "$PATCH" || {
-                echo "git am failed, aborting."
+
+              if ! git am "$PATCH" > "$PATCH_LOG" 2>&1; then
+                echo "git am failed."
+                tail -n 300 "$PATCH_LOG" || true
                 git am --abort || true
                 exit 1
-              }
+              fi
             else
               echo "Applying as plain diff with git apply"
-              git apply --check "$PATCH"
-              git apply "$PATCH"
+
+              if ! git apply --check "$PATCH" > "$PATCH_LOG.check" 2>&1; then
+                echo "git apply --check failed."
+                tail -n 300 "$PATCH_LOG.check" || true
+                exit 1
+              fi
+
+              if ! git apply "$PATCH" > "$PATCH_LOG" 2>&1; then
+                echo "git apply failed."
+                tail -n 300 "$PATCH_LOG" || true
+                exit 1
+              fi
             fi
 
             echo "Applied extra patch: ${URL}"
@@ -261,6 +514,7 @@ jobs:
           set -euxo pipefail
 
           test -f "$GITHUB_WORKSPACE/config/new.config"
+
           cp "$GITHUB_WORKSPACE/config/new.config" build/.config
 
           make -C linux O="$PWD/build" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
@@ -330,16 +584,17 @@ jobs:
             DPKG_FLAGS="-d"
 
       - name: Collect Debian package artifacts
+        if: always()
         run: |
           set -euxo pipefail
 
           mkdir -p artifacts/deb
 
-          find . -maxdepth 1 -type f -name "*.deb" -exec cp -v {} artifacts/deb/ \;
+          find . -maxdepth 1 -type f -name "*.deb" -exec cp -v {} artifacts/deb/ \; || true
           find . -maxdepth 1 -type f -name "*.changes" -exec cp -v {} artifacts/deb/ \; || true
           find . -maxdepth 1 -type f -name "*.buildinfo" -exec cp -v {} artifacts/deb/ \; || true
 
-          ls -lah artifacts/deb
+          ls -lah artifacts/deb || true
 
       - name: Generate SHA256
         if: always()
@@ -357,10 +612,9 @@ jobs:
         with:
           name: ${{ steps.artifact_name.outputs.name }}
           path: |
-            artifacts/kernel/kernel-dtb
-            artifacts/kernel/vmlinux
-            artifacts/kernel/source-version.txt
+            artifacts/kernel
             artifacts/deb
             artifacts/config
+            artifacts/patch-log
             artifacts/SHA256SUMS.txt
-          if-no-files-found: error
+          if-no-files-found: warn

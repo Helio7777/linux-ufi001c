@@ -29,7 +29,7 @@ on:
         default: "1"
 
       apply_latest_stable_patch:
-        description: "是否自动应用 kernel.org 最新 stable patch，best-effort 跳过冲突文件"
+        description: "是否自动应用 kernel.org 最新 stable patch"
         required: true
         default: "true"
 
@@ -96,7 +96,7 @@ jobs:
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) = ' linux/Makefile || true
           make -C linux kernelversion || true
 
-      - name: Apply kernel.org stable incremental patches best-effort
+      - name: Apply kernel.org stable incremental patches
         if: ${{ inputs.apply_latest_stable_patch == 'true' }}
         run: |
           set -euxo pipefail
@@ -129,6 +129,13 @@ jobs:
           echo "Latest stable version detected: ${LATEST_VERSION}"
           echo "Target patchlevel: ${TARGET}"
 
+          {
+            echo "Base version: ${BASE}"
+            echo "Current patchlevel: ${CURRENT}"
+            echo "Latest stable version: ${LATEST_VERSION}"
+            echo "Target patchlevel: ${TARGET}"
+          } > artifacts/patch-log/stable-version-info.txt
+
           if [ "$TARGET" -le "$CURRENT" ]; then
             echo "Current kernel is already >= target: ${BASE}.${CURRENT} >= ${BASE}.${TARGET}"
             exit 0
@@ -140,237 +147,166 @@ jobs:
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) = ' Makefile || true
           make kernelversion || true
 
+          auto_resolve_ktd2692_conflict() {
+            local patch_name="$1"
+            local log_dir="$2"
+
+            local file="drivers/leds/flash/leds-ktd2692.c"
+            local rej="${file}.rej"
+            local orig="${file}.orig"
+
+            echo "Checking whether conflict can be auto-resolved for ${file}"
+
+            if [ ! -f "$rej" ]; then
+              echo "Known reject file not found: $rej"
+              return 1
+            fi
+
+            echo "Found known reject file: $rej"
+            echo "Reject content:"
+            cat "$rej" | tee "$log_dir/ktd2692.reject.txt"
+
+            if ! grep -q "led->props.timing = ktd2692_timing;" "$rej"; then
+              echo "Reject file does not contain expected ktd2692 timing line."
+              return 1
+            fi
+
+            python3 - <<'PY'
+from pathlib import Path
+
+p = Path("drivers/leds/flash/leds-ktd2692.c")
+
+if not p.exists():
+    raise SystemExit("drivers/leds/flash/leds-ktd2692.c does not exist")
+
+s = p.read_text()
+
+insert = "\tled->props.timing = ktd2692_timing;\n"
+needle = "\tled_cdev = &fled_cdev->led_cdev;\n"
+
+if "led->props.timing = ktd2692_timing;" in s:
+    print("Already contains led->props.timing = ktd2692_timing;")
+else:
+    if needle not in s:
+        raise SystemExit("Cannot find insertion point: led_cdev = &fled_cdev->led_cdev;")
+
+    s = s.replace(needle, needle + insert, 1)
+    p.write_text(s)
+    print("Inserted led->props.timing = ktd2692_timing;")
+PY
+
+            rm -f "$rej"
+            rm -f "$orig"
+
+            echo "Auto-resolved known ktd2692 conflict for ${patch_name}"
+
+            {
+              echo "Patch: ${patch_name}"
+              echo "Auto-resolved file: ${file}"
+              echo "Inserted line:"
+              echo "led->props.timing = ktd2692_timing;"
+            } > "$log_dir/ktd2692-auto-resolved.txt"
+
+            return 0
+          }
+
           for NEXT in $(seq $((CURRENT + 1)) "$TARGET"); do
             PREV=$((NEXT - 1))
 
-            PATCH_URL="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/incr/patch-${BASE}.${PREV}-${NEXT}.xz"
-            PATCH_XZ="/tmp/patch-${BASE}.${PREV}-${NEXT}.xz"
-            PATCH_TXT="/tmp/patch-${BASE}.${PREV}-${NEXT}.patch"
-            FILTERED_PATCH="/tmp/patch-${BASE}.${PREV}-${NEXT}.filtered.patch"
+            PATCH_NAME="patch-${BASE}.${PREV}-${NEXT}"
+            PATCH_URL="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/incr/${PATCH_NAME}.xz"
+            PATCH_XZ="/tmp/${PATCH_NAME}.xz"
+            PATCH_TXT="/tmp/${PATCH_NAME}.patch"
 
-            LOG_DIR="../artifacts/patch-log/patch-${BASE}.${PREV}-${NEXT}"
+            LOG_DIR="../artifacts/patch-log/${PATCH_NAME}"
             mkdir -p "$LOG_DIR"
 
-            DRY_LOG="$LOG_DIR/dry-run.log"
             APPLY_LOG="$LOG_DIR/apply.log"
-            FILTER_LOG="$LOG_DIR/filter.log"
-            CONFLICT_FILES="$LOG_DIR/conflict-files.txt"
+            REJECT_FILES="$LOG_DIR/reject-files.txt"
+            REJECT_HUNKS="$LOG_DIR/reject-hunks.txt"
+
+            : > "$APPLY_LOG"
+            : > "$REJECT_FILES"
+            : > "$REJECT_HUNKS"
 
             echo "============================================================"
-            echo "Applying stable incremental patch best-effort:"
+            echo "Applying stable incremental patch:"
             echo "${PATCH_URL}"
             echo "============================================================"
 
             curl -fL "$PATCH_URL" -o "$PATCH_XZ"
             xzcat "$PATCH_XZ" > "$PATCH_TXT"
 
-            echo "Dry-run full patch ${BASE}.${PREV} -> ${BASE}.${NEXT}"
+            # 删除旧的 reject 文件，避免把上一个补丁的冲突误判为当前补丁冲突。
+            find . -name "*.rej" -type f -delete
 
             set +e
-            patch -p1 --forward --batch --dry-run < "$PATCH_TXT" > "$DRY_LOG" 2>&1
-            DRY_RC=$?
+            patch -p1 --forward --batch < "$PATCH_TXT" > "$APPLY_LOG" 2>&1
+            APPLY_RC=$?
             set -e
 
-            if [ "$DRY_RC" -eq 0 ]; then
-              echo "Full patch dry-run passed. Applying full patch."
+            echo "patch exit code: $APPLY_RC"
 
-              set +e
-              patch -p1 --forward --batch < "$PATCH_TXT" > "$APPLY_LOG" 2>&1
-              APPLY_RC=$?
-              set -e
+            if [ "$APPLY_RC" -ne 0 ]; then
+              echo "Patch returned non-zero: ${PATCH_NAME}"
+              echo "Patch log tail:"
+              tail -n 300 "$APPLY_LOG" || true
+            fi
 
-              echo "full patch exit code: $APPLY_RC"
+            find . -name "*.rej" -type f | sort > "$REJECT_FILES"
 
-              if [ "$APPLY_RC" -ne 0 ]; then
-                echo "Full patch apply returned non-zero, but continue best-effort."
-                tail -n 200 "$APPLY_LOG" || true
-              fi
+            if [ -s "$REJECT_FILES" ]; then
+              echo "Reject files found after ${PATCH_NAME}:"
+              cat "$REJECT_FILES"
 
-            else
-              echo "Full patch dry-run failed. Trying to skip conflicted files."
+              {
+                echo "Reject hunks for ${PATCH_NAME}:"
+                while IFS= read -r rej; do
+                  [ -z "$rej" ] && continue
+                  src="${rej%.rej}"
+                  rel="${src#./}"
 
-              echo "---- dry-run log tail ----"
-              tail -n 200 "$DRY_LOG" || true
-              echo "--------------------------"
+                  echo
+                  echo "============================================================"
+                  echo "Patch: ${PATCH_NAME}"
+                  echo "Conflict file: $rel"
+                  echo "Reject file: ${rej#./}"
+                  echo "============================================================"
+                  cat "$rej"
+                done < "$REJECT_FILES"
+              } | tee "$REJECT_HUNKS"
 
-              python3 - "$DRY_LOG" "$CONFLICT_FILES" <<'PY'
-          import sys
-          from pathlib import Path
+              REJECT_COUNT="$(wc -l < "$REJECT_FILES" | tr -d ' ')"
+              ONLY_REJECT="$(cat "$REJECT_FILES")"
 
-          dry_log = Path(sys.argv[1])
-          out = Path(sys.argv[2])
+              if [ "$REJECT_COUNT" = "1" ] && [ "$ONLY_REJECT" = "./drivers/leds/flash/leds-ktd2692.c.rej" ]; then
+                echo "Only known ktd2692 conflict detected. Trying auto-resolve."
 
-          current = None
-          bad = set()
-
-          for line in dry_log.read_text(errors="ignore").splitlines():
-              line = line.rstrip("\n")
-
-              for prefix in ("checking file ", "patching file "):
-                  if line.startswith(prefix):
-                      current = line[len(prefix):].strip()
-                      break
-
-              lower = line.lower()
-
-              failed_markers = [
-                  "failed",
-                  "malformed patch",
-                  "can't find file to patch",
-                  "no file to patch",
-                  "does not exist",
-                  "is not a regular file",
-                  "reversed or previously applied",
-                  "previously applied",
-                  "already applied",
-                  "skipping patch",
-                  "hunk",
-              ]
-
-              if current and any(marker in lower for marker in failed_markers):
-                  if "succeeded" not in lower:
-                      bad.add(current)
-
-          out.write_text("\n".join(sorted(bad)) + ("\n" if bad else ""))
-          PY
-
-              echo "Conflict files detected:"
-              cat "$CONFLICT_FILES" || true
-
-              if [ ! -s "$CONFLICT_FILES" ]; then
-                echo "No conflict files parsed from dry-run log."
-                echo "Fallback: apply original patch best-effort and continue."
-
-                set +e
-                patch -p1 --forward --batch < "$PATCH_TXT" > "$APPLY_LOG" 2>&1
-                APPLY_RC=$?
-                set -e
-
-                echo "patch exit code: $APPLY_RC"
-                tail -n 200 "$APPLY_LOG" || true
-
-              else
-                echo "Filtering patch and removing conflicted file diffs..."
-
-                python3 - "$PATCH_TXT" "$CONFLICT_FILES" "$FILTERED_PATCH" "$FILTER_LOG" <<'PY'
-          import sys
-          import re
-          from pathlib import Path
-
-          patch_file = Path(sys.argv[1])
-          conflict_file = Path(sys.argv[2])
-          out_file = Path(sys.argv[3])
-          log_file = Path(sys.argv[4])
-
-          conflicts = set(
-              line.strip()
-              for line in conflict_file.read_text(errors="ignore").splitlines()
-              if line.strip()
-          )
-
-          lines = patch_file.read_text(errors="ignore").splitlines(keepends=True)
-
-          blocks = []
-          current = []
-
-          for line in lines:
-              if line.startswith("diff --git "):
-                  if current:
-                      blocks.append(current)
-                  current = [line]
-              else:
-                  if current:
-                      current.append(line)
-                  else:
-                      current = [line]
-
-          if current:
-              blocks.append(current)
-
-          kept = []
-          skipped = []
-
-          diff_re = re.compile(r"^diff --git a/(.*?) b/(.*?)\s*$")
-
-          for block in blocks:
-              first = block[0].rstrip("\n")
-              m = diff_re.match(first)
-
-              if not m:
-                  kept.extend(block)
-                  continue
-
-              a_path, b_path = m.group(1), m.group(2)
-
-              if a_path in conflicts or b_path in conflicts:
-                  skipped.append(a_path)
-                  continue
-
-              kept.extend(block)
-
-          out_file.write_text("".join(kept))
-
-          log_file.write_text(
-              "Conflicted files:\n"
-              + "\n".join(sorted(conflicts))
-              + "\n\nSkipped diff blocks:\n"
-              + "\n".join(sorted(set(skipped)))
-              + "\n"
-          )
-          PY
-
-                echo "Filtered patch info:"
-                cat "$FILTER_LOG" || true
-
-                echo "Dry-run filtered patch..."
-
-                set +e
-                patch -p1 --forward --batch --dry-run < "$FILTERED_PATCH" > "$LOG_DIR/filtered-dry-run.log" 2>&1
-                FILTER_DRY_RC=$?
-                set -e
-
-                if [ "$FILTER_DRY_RC" -eq 0 ]; then
-                  echo "Filtered patch dry-run passed. Applying filtered patch."
-
-                  set +e
-                  patch -p1 --forward --batch < "$FILTERED_PATCH" > "$APPLY_LOG" 2>&1
-                  APPLY_RC=$?
-                  set -e
-
-                  echo "filtered patch exit code: $APPLY_RC"
-
-                  if [ "$APPLY_RC" -ne 0 ]; then
-                    tail -n 200 "$APPLY_LOG" || true
-                  fi
-
+                if auto_resolve_ktd2692_conflict "$PATCH_NAME" "$LOG_DIR"; then
+                  echo "Known ktd2692 conflict resolved."
                 else
-                  echo "Filtered patch still failed."
-                  echo "Fallback: apply original patch best-effort and continue."
-
-                  tail -n 200 "$LOG_DIR/filtered-dry-run.log" || true
-
-                  set +e
-                  patch -p1 --forward --batch < "$PATCH_TXT" > "$APPLY_LOG" 2>&1
-                  APPLY_RC=$?
-                  set -e
-
-                  echo "fallback patch exit code: $APPLY_RC"
-                  tail -n 200 "$APPLY_LOG" || true
+                  echo "Failed to auto-resolve known ktd2692 conflict."
+                  exit 1
                 fi
+              else
+                echo "Unhandled patch conflicts found. Failing."
+                exit 1
               fi
             fi
 
-            echo "Collecting .rej and .orig files after ${BASE}.${PREV} -> ${BASE}.${NEXT}"
+            REMAINING_REJECTS="$(find . -name "*.rej" -type f | sort || true)"
+            if [ -n "$REMAINING_REJECTS" ]; then
+              echo "Unresolved reject files remain:"
+              echo "$REMAINING_REJECTS"
+              exit 1
+            fi
 
-            find . \( -name "*.rej" -o -name "*.orig" \) -type f | sort > "$LOG_DIR/reject-orig-files.txt" || true
+            if [ "$APPLY_RC" -ne 0 ]; then
+              echo "Patch command returned non-zero, but known reject was resolved."
+              echo "Verifying no reject files remain before continuing."
+            fi
 
-            while IFS= read -r f; do
-              [ -z "$f" ] && continue
-              mkdir -p "$LOG_DIR/files/$(dirname "$f")"
-              cp -v "$f" "$LOG_DIR/files/$f" || true
-            done < "$LOG_DIR/reject-orig-files.txt"
-
-            echo "Applied best-effort stable patch ${BASE}.${PREV} -> ${BASE}.${NEXT}"
+            echo "Applied stable patch ${BASE}.${PREV} -> ${BASE}.${NEXT}"
 
             echo "Kernel Makefile version after patch ${BASE}.${NEXT}:"
             grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) = ' Makefile || true
@@ -381,7 +317,7 @@ jobs:
           done
 
           echo "============================================================"
-          echo "Finished best-effort stable patching."
+          echo "Finished stable patching."
           echo "============================================================"
 
           echo "Final kernel version:"
@@ -527,31 +463,31 @@ jobs:
           set -euxo pipefail
 
           python3 - <<'PY'
-          from pathlib import Path
+from pathlib import Path
 
-          def parse(path):
-              cfg = {}
-              for line in Path(path).read_text().splitlines():
-                  if line.startswith("CONFIG_") and "=" in line:
-                      k, v = line.split("=", 1)
-                      cfg[k] = v
-              return cfg
+def parse(path):
+    cfg = {}
+    for line in Path(path).read_text().splitlines():
+        if line.startswith("CONFIG_") and "=" in line:
+            k, v = line.split("=", 1)
+            cfg[k] = v
+    return cfg
 
-          new = parse("build/.config")
+new = parse("build/.config")
 
-          critical = [
-              "CONFIG_ARCH_QCOM",
-              "CONFIG_SERIAL_MSM",
-              "CONFIG_MMC_SDHCI_MSM",
-              "CONFIG_EXT4_FS",
-          ]
+critical = [
+    "CONFIG_ARCH_QCOM",
+    "CONFIG_SERIAL_MSM",
+    "CONFIG_MMC_SDHCI_MSM",
+    "CONFIG_EXT4_FS",
+]
 
-          bad = [k for k in critical if new.get(k) != "y"]
+bad = [k for k in critical if new.get(k) != "y"]
 
-          if bad:
-              print(f"Critical config missing: {bad}")
-              exit(1)
-          PY
+if bad:
+    print(f"Critical config missing: {bad}")
+    exit(1)
+PY
 
       - name: Build kernel and modules
         run: |

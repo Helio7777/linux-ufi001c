@@ -1,0 +1,554 @@
+name: Apply latest stable patch and list conflicts
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Kernel repository"
+        required: true
+        default: "https://github.com/msm8916-mainline/linux.git"
+
+      ref:
+        description: "Git ref, branch, tag or commit"
+        required: true
+        default: "v6.12.1-msm8916"
+
+      device_dtb:
+        description: "Device DTB path"
+        required: true
+        default: "arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb"
+
+      kernel_base_version:
+        description: "Kernel base version, for example 6.12"
+        required: true
+        default: "6.12"
+
+      kernel_current_patchlevel:
+        description: "Current stable patchlevel, for example 1 for 6.12.1"
+        required: true
+        default: "1"
+
+      apply_latest_stable_patch:
+        description: "Apply latest kernel.org stable patches"
+        required: true
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
+
+      extra_patch_urls:
+        description: "Extra patch URLs, one per line. Optional."
+        required: false
+        default: ""
+
+jobs:
+  apply-patches:
+    name: Apply stable patches and collect conflicts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install tools
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            curl \
+            jq \
+            xz-utils \
+            gzip \
+            bzip2 \
+            zstd \
+            patch \
+            make \
+            ca-certificates
+
+      - name: Prepare artifact directories
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts/patch-log
+          mkdir -p artifacts/config
+          mkdir -p artifacts/kernel
+          mkdir -p artifacts/deb
+
+      - name: Clone kernel repository
+        run: |
+          set -euxo pipefail
+
+          REPO="${{ inputs.repository }}"
+          REF="${{ inputs.ref }}"
+
+          echo "Repository: ${REPO}"
+          echo "Ref: ${REF}"
+
+          git init linux
+          cd linux
+
+          git remote add origin "${REPO}"
+
+          # Fetch enough history for tag/branch/commit checkout.
+          git fetch --tags --force origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'
+
+          if git rev-parse --verify --quiet "${REF}^{commit}"; then
+            git checkout --force "${REF}"
+          elif git rev-parse --verify --quiet "origin/${REF}^{commit}"; then
+            git checkout --force "origin/${REF}"
+          else
+            git fetch --force origin "${REF}"
+            git checkout --force FETCH_HEAD
+          fi
+
+          git submodule update --init --recursive || true
+
+      - name: Print initial kernel info
+        run: |
+          set -euxo pipefail
+
+          {
+            echo "Repository: ${{ inputs.repository }}"
+            echo "Ref: ${{ inputs.ref }}"
+            echo "Device DTB: ${{ inputs.device_dtb }}"
+            echo "Base version: ${{ inputs.kernel_base_version }}"
+            echo "Current patchlevel input: ${{ inputs.kernel_current_patchlevel }}"
+            echo "Apply latest stable patch: ${{ inputs.apply_latest_stable_patch }}"
+            echo "Extra patch URLs:"
+            printf '%s\n' "${{ inputs.extra_patch_urls }}"
+            echo
+          } | tee artifacts/patch-log/input-info.txt
+
+          cd linux
+
+          {
+            echo "make kernelversion:"
+            make kernelversion || true
+            echo
+            echo "git HEAD:"
+            git log -1 --oneline || true
+            echo
+            echo "git status:"
+            git status --short || true
+            echo
+            echo "Top-level Makefile version fields:"
+            grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) = ' Makefile || true
+          } | tee ../artifacts/patch-log/initial-kernel-info.txt
+
+      - name: Apply latest kernel.org stable patches and collect all conflicts
+        if: ${{ inputs.apply_latest_stable_patch == 'true' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          BASE="${{ inputs.kernel_base_version }}"
+          CURRENT="${{ inputs.kernel_current_patchlevel }}"
+          MAJOR="${BASE%%.*}"
+
+          mkdir -p artifacts/patch-log
+
+          echo "Base kernel version: ${BASE}"
+          echo "Current patchlevel input: ${CURRENT}"
+
+          LATEST_VERSION="$(
+            curl -fsSL https://www.kernel.org/releases.json |
+            jq -r --arg base "$BASE" '
+              .releases[]
+              | select(.version | test("^" + $base + "\\.[0-9]+$"))
+              | .version
+            ' |
+            sort -V |
+            tail -n1
+          )"
+
+          if [ -z "$LATEST_VERSION" ] || [ "$LATEST_VERSION" = "null" ]; then
+            echo "Could not find latest stable version for ${BASE}"
+            exit 1
+          fi
+
+          TARGET="${LATEST_VERSION##*.}"
+
+          echo "Latest stable version detected: ${LATEST_VERSION}"
+          echo "Target patchlevel: ${TARGET}"
+
+          {
+            echo "Base version: ${BASE}"
+            echo "Current patchlevel input: ${CURRENT}"
+            echo "Latest stable version: ${LATEST_VERSION}"
+            echo "Target patchlevel: ${TARGET}"
+          } > artifacts/patch-log/stable-version-info.txt
+
+          if [ "$TARGET" -le "$CURRENT" ]; then
+            echo "Current kernel is already >= target: ${BASE}.${CURRENT} >= ${BASE}.${TARGET}"
+            echo "No stable patches to apply." > artifacts/patch-log/all-conflict-files.txt
+            echo "No stable patches to apply." > artifacts/patch-log/all-conflict-files-with-patch.txt
+            echo "No stable patches to apply." > artifacts/patch-log/all-reject-hunks.txt
+            exit 0
+          fi
+
+          cd linux
+
+          echo "Kernel version before stable patches:"
+          make kernelversion || true
+
+          echo "Top-level Makefile before stable patches:"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) = ' Makefile || true
+
+          ALL_CONFLICT_FILES="../artifacts/patch-log/all-conflict-files.txt"
+          ALL_CONFLICT_FILES_WITH_PATCH="../artifacts/patch-log/all-conflict-files-with-patch.txt"
+          ALL_REJECT_HUNKS="../artifacts/patch-log/all-reject-hunks.txt"
+          PATCH_RESULT_SUMMARY="../artifacts/patch-log/patch-result-summary.txt"
+
+          : > "$ALL_CONFLICT_FILES"
+          : > "$ALL_CONFLICT_FILES_WITH_PATCH"
+          : > "$ALL_REJECT_HUNKS"
+          : > "$PATCH_RESULT_SUMMARY"
+
+          HAD_REJECT=0
+
+          for NEXT in $(seq $((CURRENT + 1)) "$TARGET"); do
+            PREV=$((NEXT - 1))
+
+            PATCH_NAME="patch-${BASE}.${PREV}-${NEXT}"
+            PATCH_URL="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/incr/${PATCH_NAME}.xz"
+
+            PATCH_XZ="/tmp/${PATCH_NAME}.xz"
+            PATCH_TXT="/tmp/${PATCH_NAME}.patch"
+
+            LOG_DIR="../artifacts/patch-log/${PATCH_NAME}"
+            mkdir -p "$LOG_DIR"
+
+            APPLY_LOG="$LOG_DIR/apply.log"
+            CONFLICT_FILES="$LOG_DIR/conflict-files.txt"
+            REJECT_HUNKS="$LOG_DIR/reject-hunks.txt"
+            REJECT_FILES_RAW="$LOG_DIR/reject-files-raw.txt"
+
+            : > "$CONFLICT_FILES"
+            : > "$REJECT_HUNKS"
+            : > "$REJECT_FILES_RAW"
+
+            echo "============================================================"
+            echo "Applying stable patch:"
+            echo "${PATCH_URL}"
+            echo "============================================================"
+
+            {
+              echo "Patch: ${PATCH_NAME}"
+              echo "URL: ${PATCH_URL}"
+            } >> "$PATCH_RESULT_SUMMARY"
+
+            curl -fL "$PATCH_URL" -o "$PATCH_XZ"
+            xzcat "$PATCH_XZ" > "$PATCH_TXT"
+
+            # 删除上一个补丁留下的 .rej，避免重复统计。
+            # 注意：这里只删除 .rej，不回滚已经部分应用的内容。
+            find . -name "*.rej" -delete
+
+            set +e
+            patch -p1 --forward --batch < "$PATCH_TXT" > "$APPLY_LOG" 2>&1
+            PATCH_RC=$?
+            set -e
+
+            echo "patch exit code: ${PATCH_RC}" >> "$PATCH_RESULT_SUMMARY"
+
+            echo "Patch log tail for ${PATCH_NAME}:"
+            tail -n 120 "$APPLY_LOG" || true
+
+            find . -name "*.rej" -print | sort > "$REJECT_FILES_RAW"
+
+            if [ -s "$REJECT_FILES_RAW" ]; then
+              HAD_REJECT=1
+
+              echo "Reject files found in ${PATCH_NAME}:"
+
+              while IFS= read -r rej; do
+                [ -z "$rej" ] && continue
+
+                src="${rej%.rej}"
+                rel="${src#./}"
+
+                echo "$rel" | tee -a "$CONFLICT_FILES"
+                echo "$rel" >> "$ALL_CONFLICT_FILES"
+                echo "${PATCH_NAME}: $rel" >> "$ALL_CONFLICT_FILES_WITH_PATCH"
+
+                {
+                  echo
+                  echo "============================================================"
+                  echo "Patch: ${PATCH_NAME}"
+                  echo "Conflict file: $rel"
+                  echo "Reject file: ${rej#./}"
+                  echo "============================================================"
+                  cat "$rej"
+                } | tee -a "$REJECT_HUNKS" >> "$ALL_REJECT_HUNKS"
+
+              done < "$REJECT_FILES_RAW"
+
+              echo "Conflict files for ${PATCH_NAME}:"
+              cat "$CONFLICT_FILES"
+
+              echo "Reject hunks saved to:"
+              echo "$REJECT_HUNKS"
+            else
+              echo "No .rej files for ${PATCH_NAME}."
+            fi
+
+            grep -E "FAILED|saving rejects|can't find file|No file to patch|malformed patch|Reversed|previously applied|Skipping patch" "$APPLY_LOG" \
+              > "$LOG_DIR/failure-lines.txt" || true
+
+            if [ -s "$LOG_DIR/failure-lines.txt" ]; then
+              {
+                echo
+                echo "Failure lines from ${PATCH_NAME}:"
+                cat "$LOG_DIR/failure-lines.txt"
+              } >> "$PATCH_RESULT_SUMMARY"
+            fi
+
+            echo >> "$PATCH_RESULT_SUMMARY"
+
+            echo "Kernel version after ${PATCH_NAME}:"
+            make kernelversion || true
+
+            echo "Top-level Makefile after ${PATCH_NAME}:"
+            grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) = ' Makefile || true
+          done
+
+          echo "============================================================"
+          echo "Stable patch application finished."
+          echo "============================================================"
+
+          echo "Final kernel version:"
+          make kernelversion || true
+
+          echo "Final top-level Makefile version:"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) = ' Makefile || true
+
+          echo "Final git status:"
+          git status --short | tee ../artifacts/patch-log/final-git-status.txt
+
+          sort -u "$ALL_CONFLICT_FILES" -o "$ALL_CONFLICT_FILES" || true
+
+          echo
+          echo "============================================================"
+          echo "All conflict files:"
+          echo "============================================================"
+
+          if [ -s "$ALL_CONFLICT_FILES" ]; then
+            cat "$ALL_CONFLICT_FILES"
+          else
+            echo "No .rej conflict files found." | tee "$ALL_CONFLICT_FILES"
+          fi
+
+          echo
+          echo "============================================================"
+          echo "All conflict files with patch name:"
+          echo "============================================================"
+
+          if [ -s "$ALL_CONFLICT_FILES_WITH_PATCH" ]; then
+            cat "$ALL_CONFLICT_FILES_WITH_PATCH"
+          else
+            echo "No .rej conflict files found." | tee "$ALL_CONFLICT_FILES_WITH_PATCH"
+          fi
+
+          echo
+          echo "============================================================"
+          echo "All reject hunks saved to:"
+          echo "  artifacts/patch-log/all-reject-hunks.txt"
+          echo "============================================================"
+
+          if [ "$HAD_REJECT" -ne 0 ]; then
+            echo
+            echo "Patch rejects were found."
+            echo "The source tree is partially patched and should not be treated as a clean stable update."
+            echo "Failing this step intentionally after collecting all conflict information."
+            exit 1
+          fi
+
+          echo "No rejects found. Stable patches appear to have applied cleanly."
+
+      - name: Apply extra patch URLs and collect conflicts
+        if: ${{ inputs.extra_patch_urls != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p artifacts/patch-log/extra-patches
+
+          cd linux
+
+          EXTRA_ALL_CONFLICT_FILES="../artifacts/patch-log/extra-conflict-files.txt"
+          EXTRA_ALL_CONFLICT_FILES_WITH_PATCH="../artifacts/patch-log/extra-conflict-files-with-patch.txt"
+          EXTRA_ALL_REJECT_HUNKS="../artifacts/patch-log/extra-reject-hunks.txt"
+
+          : > "$EXTRA_ALL_CONFLICT_FILES"
+          : > "$EXTRA_ALL_CONFLICT_FILES_WITH_PATCH"
+          : > "$EXTRA_ALL_REJECT_HUNKS"
+
+          HAD_EXTRA_REJECT=0
+          INDEX=0
+
+          printf '%s\n' "${{ inputs.extra_patch_urls }}" | while IFS= read -r PATCH_URL; do
+            [ -z "$PATCH_URL" ] && continue
+
+            INDEX=$((INDEX + 1))
+            PATCH_NAME="extra-patch-${INDEX}"
+
+            LOG_DIR="../artifacts/patch-log/extra-patches/${PATCH_NAME}"
+            mkdir -p "$LOG_DIR"
+
+            RAW_PATCH="/tmp/${PATCH_NAME}.download"
+            PATCH_TXT="/tmp/${PATCH_NAME}.patch"
+
+            APPLY_LOG="$LOG_DIR/apply.log"
+            CONFLICT_FILES="$LOG_DIR/conflict-files.txt"
+            REJECT_HUNKS="$LOG_DIR/reject-hunks.txt"
+            REJECT_FILES_RAW="$LOG_DIR/reject-files-raw.txt"
+
+            : > "$CONFLICT_FILES"
+            : > "$REJECT_HUNKS"
+            : > "$REJECT_FILES_RAW"
+
+            echo "============================================================"
+            echo "Applying extra patch:"
+            echo "$PATCH_URL"
+            echo "============================================================"
+
+            curl -fL "$PATCH_URL" -o "$RAW_PATCH"
+
+            case "$PATCH_URL" in
+              *.xz)
+                xzcat "$RAW_PATCH" > "$PATCH_TXT"
+                ;;
+              *.gz)
+                gzip -dc "$RAW_PATCH" > "$PATCH_TXT"
+                ;;
+              *.bz2)
+                bzip2 -dc "$RAW_PATCH" > "$PATCH_TXT"
+                ;;
+              *.zst)
+                zstd -dc "$RAW_PATCH" > "$PATCH_TXT"
+                ;;
+              *)
+                cp "$RAW_PATCH" "$PATCH_TXT"
+                ;;
+            esac
+
+            find . -name "*.rej" -delete
+
+            set +e
+            patch -p1 --forward --batch < "$PATCH_TXT" > "$APPLY_LOG" 2>&1
+            PATCH_RC=$?
+            set -e
+
+            echo "patch exit code: ${PATCH_RC}"
+            tail -n 120 "$APPLY_LOG" || true
+
+            find . -name "*.rej" -print | sort > "$REJECT_FILES_RAW"
+
+            if [ -s "$REJECT_FILES_RAW" ]; then
+              HAD_EXTRA_REJECT=1
+
+              while IFS= read -r rej; do
+                [ -z "$rej" ] && continue
+
+                src="${rej%.rej}"
+                rel="${src#./}"
+
+                echo "$rel" | tee -a "$CONFLICT_FILES"
+                echo "$rel" >> "$EXTRA_ALL_CONFLICT_FILES"
+                echo "${PATCH_NAME}: $rel" >> "$EXTRA_ALL_CONFLICT_FILES_WITH_PATCH"
+
+                {
+                  echo
+                  echo "============================================================"
+                  echo "Patch: ${PATCH_NAME}"
+                  echo "URL: ${PATCH_URL}"
+                  echo "Conflict file: $rel"
+                  echo "Reject file: ${rej#./}"
+                  echo "============================================================"
+                  cat "$rej"
+                } | tee -a "$REJECT_HUNKS" >> "$EXTRA_ALL_REJECT_HUNKS"
+
+              done < "$REJECT_FILES_RAW"
+            fi
+
+            sort -u "$EXTRA_ALL_CONFLICT_FILES" -o "$EXTRA_ALL_CONFLICT_FILES" || true
+
+            if [ "$HAD_EXTRA_REJECT" -ne 0 ]; then
+              echo "Extra patch rejects were found."
+              exit 1
+            fi
+          done
+
+      - name: Collect final reject files from workspace
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p artifacts/patch-log/final-reject-scan
+
+          echo "Scanning final workspace for .rej files..."
+
+          find linux -name "*.rej" -print | sort \
+            | tee artifacts/patch-log/final-reject-scan/reject-files-raw.txt
+
+          sed 's/\.rej$//' artifacts/patch-log/final-reject-scan/reject-files-raw.txt \
+            | sed 's#^linux/##' \
+            | tee artifacts/patch-log/final-reject-scan/reject-files.txt
+
+          {
+            echo "Final reject hunks:"
+            while IFS= read -r rej; do
+              [ -z "$rej" ] && continue
+              src="${rej%.rej}"
+              rel="${src#linux/}"
+
+              echo
+              echo "============================================================"
+              echo "Conflict file: $rel"
+              echo "Reject file: ${rej#linux/}"
+              echo "============================================================"
+              cat "$rej"
+            done < artifacts/patch-log/final-reject-scan/reject-files-raw.txt
+          } | tee artifacts/patch-log/final-reject-scan/reject-hunks.txt
+
+          echo "Scanning final workspace for .orig files..."
+
+          find linux -name "*.orig" -print | sort \
+            | tee artifacts/patch-log/final-reject-scan/orig-files.txt
+
+      - name: Print patch log summary
+        if: always()
+        run: |
+          set -euxo pipefail
+
+          echo "============================================================"
+          echo "stable-version-info.txt"
+          echo "============================================================"
+          cat artifacts/patch-log/stable-version-info.txt || true
+
+          echo
+          echo "============================================================"
+          echo "all-conflict-files.txt"
+          echo "============================================================"
+          cat artifacts/patch-log/all-conflict-files.txt || true
+
+          echo
+          echo "============================================================"
+          echo "all-conflict-files-with-patch.txt"
+          echo "============================================================"
+          cat artifacts/patch-log/all-conflict-files-with-patch.txt || true
+
+          echo
+          echo "============================================================"
+          echo "patch-result-summary.txt"
+          echo "============================================================"
+          cat artifacts/patch-log/patch-result-summary.txt || true
+
+      - name: Upload patch logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-conflict-logs
+          path: |
+            artifacts/patch-log
+          if-no-files-found: warn

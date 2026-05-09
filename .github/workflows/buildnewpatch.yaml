@@ -1,5 +1,4 @@
 name: build-msm8916-linux-v6.12-patch
-
 on:
   workflow_dispatch:
     inputs:
@@ -43,6 +42,7 @@ permissions:
 
 jobs:
   build:
+    name: Build msm8916 kernel
     runs-on: ubuntu-24.04
 
     env:

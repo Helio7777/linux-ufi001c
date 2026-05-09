@@ -6,32 +6,26 @@ on:
         description: "主线内核仓库"
         required: true
         default: "https://github.com/msm8916-mainline/linux.git"
-
       new_kernel_ref:
         description: "主线内核分支或 tag"
         required: true
         default: "v6.12.1-msm8916"
-
       device_dtb:
         description: "目标 DTB 相对路径"
         required: true
         default: "arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb"
-
       kernel_base_version:
         description: "内核主版本，例如 6.12"
         required: true
         default: "6.12"
-
       kernel_current_patchlevel:
         description: "当前内核 patchlevel，例如 1 表示 v6.12.1"
         required: true
         default: "1"
-
       apply_latest_stable_patch:
         description: "是否自动应用 kernel.org 最新 stable patch"
         required: true
         default: "true"
-
       extra_patch_urls:
         description: "额外补丁 URL，多个用空格分隔，可留空"
         required: false
